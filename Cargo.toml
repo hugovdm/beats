@@ -1,0 +1,11 @@
+[package]
+name = "beats"
+version = "0.1.0"
+authors = ["Hugo van der Merwe <17109322+hugovdm@users.noreply.github.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+portaudio = "0.7.0"
+#three = "0.4.0"
