@@ -1,48 +1,42 @@
-use portaudio;
-use std::sync::mpsc;
-
 fn main() {
-    // Construct a portaudio instance that will connect to a native audio API
-    let pa = portaudio::PortAudio::new().expect("Unable to init PortAudio");
-    // Collect information about the default microphone
-    let mic_index = pa
+    use cpal::traits::{DeviceTrait, HostTrait};
+    // use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let host = cpal::default_host();
+    let _input_device = host
         .default_input_device()
-        .expect("Unable to get default device");
-    let mic = pa.device_info(mic_index).expect("unable to get mic info");
+        .expect("No input device available.");
+    let output_device = host
+        .default_output_device()
+        .expect("No output device available.");
 
-    // Set parameters for the stream settings.
-    // We pass which mic should be used, how many channels are used,
-    // whether all the values of all the channels should be passed in a
-    // single audiobuffer and the latency that should be considered
-    let input_params =
-        portaudio::StreamParameters::<f32>::new(mic_index, 1, true, mic.default_low_input_latency);
+    let mut supported_configs_range = output_device
+        .supported_output_configs()
+        .expect("error while querying configs");
+    let supported_config = supported_configs_range
+        .next()
+        .expect("no supported config?!")
+        .with_max_sample_rate();
 
-    // Settings for an inputstream.
-    // Here we pass the stream parameters we set before,
-    // the sample rate of the mic and the amount values we want to receive
-    let input_settings =
-        portaudio::InputStreamSettings::new(input_params, mic.default_sample_rate, 256);
+    // use cpal::{Data, Sample, SampleFormat};
+    use cpal::{Sample, SampleFormat};
+    use cpal::StreamConfig;
+    let err_fn = |err| eprintln!("an error occurred on the output audio stream: {}", err);
+    let sample_format = supported_config.sample_format();
+    let config: StreamConfig = supported_config.into();
 
-    // Creating a channel so we can receive audio values asynchronously
-    let (sender, receiver) = mpsc::channel();
+    println!("{:?}", config.sample_rate);
 
-    // A callback function that should be as short as possible so we send all the info to a different thread
-    let callback =
-        move |portaudio::InputStreamCallbackArgs { buffer, .. }| match sender.send(buffer) {
-            Ok(_) => portaudio::Continue,
-            Err(_) => portaudio::Complete,
-        };
+    let _stream = match sample_format {
+        SampleFormat::F32 => output_device.build_output_stream(&config, write_silence::<f32>, err_fn),
+        SampleFormat::I16 => output_device.build_output_stream(&config, write_silence::<i16>, err_fn),
+        SampleFormat::U16 => output_device.build_output_stream(&config, write_silence::<u16>, err_fn),
+    }
+    .unwrap();
 
-    // Creating & starting the input stream with our settings & callback
-    let mut stream = pa
-        .open_non_blocking_stream(input_settings, callback)
-        .expect("Unable to create stream");
-    stream.start().expect("Unable to start stream");
-
-    //Printing values every time we receive new ones while the stream is active
-    while stream.is_active().unwrap() {
-        while let Ok(buffer) = receiver.try_recv() {
-            println!("{:?}", buffer);
+    fn write_silence<T: Sample>(data: &mut [T], _: &cpal::OutputCallbackInfo) {
+        for sample in data.iter_mut() {
+            *sample = Sample::from(&0.0);
         }
     }
 }
