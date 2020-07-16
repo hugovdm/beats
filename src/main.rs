@@ -18,21 +18,44 @@ fn main() {
         .expect("no supported config?!")
         .with_max_sample_rate();
 
+    let mut extra_config_opt = supported_configs_range.next();
+    while extra_config_opt != None {
+        let extra_config = extra_config_opt
+            .expect("error while iterating over supported configs")
+            .with_max_sample_rate();
+        println!("{:?}", extra_config);
+        extra_config_opt = supported_configs_range.next();
+    }
+    println!();
+
     // use cpal::{Data, Sample, SampleFormat};
     use cpal::{Sample, SampleFormat};
-    use cpal::StreamConfig;
     let err_fn = |err| eprintln!("an error occurred on the output audio stream: {}", err);
     let sample_format = supported_config.sample_format();
-    let config: StreamConfig = supported_config.into();
+    println!("supported_config was: {:?}", supported_config);
 
-    println!("{:?}", config.sample_rate);
+    let mut config: cpal::StreamConfig = supported_config.into();
+    // Overriding values anyway:
+    config.channels = 1;
+    config.sample_rate = cpal::SampleRate(44100);
+    println!("using config: {:?}", config);
 
     let _stream = match sample_format {
-        SampleFormat::F32 => output_device.build_output_stream(&config, write_silence::<f32>, err_fn),
-        SampleFormat::I16 => output_device.build_output_stream(&config, write_silence::<i16>, err_fn),
-        SampleFormat::U16 => output_device.build_output_stream(&config, write_silence::<u16>, err_fn),
+        SampleFormat::F32 => {
+            output_device.build_output_stream(&config, write_silence::<f32>, err_fn)
+        }
+        SampleFormat::I16 => {
+            output_device.build_output_stream(&config, write_silence::<i16>, err_fn)
+        }
+        SampleFormat::U16 => {
+            output_device.build_output_stream(&config, write_silence::<u16>, err_fn)
+        }
+    };
+    if let Err(e) = _stream {
+        println!("Error from build_output_stream: {}", e);
+        return ();
     }
-    .unwrap();
+    let _stream = _stream.unwrap();
 
     fn write_silence<T: Sample>(data: &mut [T], _: &cpal::OutputCallbackInfo) {
         for sample in data.iter_mut() {
