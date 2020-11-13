@@ -7,11 +7,10 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cpal = "0.12.0"
+cpal = "0.13.1"
 env_logger = "0.7"
 futures = "0.3"
-portaudio = "0.7.0"
-#three = "0.4.0"
+ringbuf = "0.2"
 wgpu = "0.5"
 wgpu_glyph = "0.9"
 winit = "0.22"

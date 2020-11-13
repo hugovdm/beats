@@ -1,102 +1,113 @@
-use std::error::Error;
+//! Assumes that the input and output devices can use the same stream configuration and that they
+//! support the f32 sample format.
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::RingBuffer;
+
+const LATENCY_MS: f32 = 150.0;
+
 use wgpu_glyph::{ab_glyph, GlyphBrushBuilder, Section, Text};
 
-fn main() -> Result<(), Box<dyn Error>> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    // use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Conditionally compile with jack if the feature is specified.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd"),
+        feature = "jack"
+    ))]
+    // Manually check for flags. Can be passed through cargo with -- e.g.
+    // cargo run --release --example beep --features jack -- --jack
+    let host = if std::env::args()
+        .collect::<String>()
+        .contains(&String::from("--jack"))
+    {
+        cpal::host_from_id(cpal::available_hosts()
+            .into_iter()
+            .find(|id| *id == cpal::HostId::Jack)
+            .expect(
+                "make sure --features jack is specified. only works on OSes where jack is available",
+            )).expect("jack host unavailable")
+    } else {
+        cpal::default_host()
+    };
 
+    #[cfg(any(
+        not(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd")),
+        not(feature = "jack")
+    ))]
     let host = cpal::default_host();
+
+    // Default devices.
     let input_device = host
         .default_input_device()
-        .expect("No input device available.");
+        .expect("failed to get default input device");
     let output_device = host
         .default_output_device()
-        .expect("No output device available.");
+        .expect("failed to get default output device");
+    println!("Using default input device: \"{}\"", input_device.name()?);
+    println!("Using default output device: \"{}\"", output_device.name()?);
 
-    let mut supported_input_configs_range = input_device
-        .supported_input_configs()
-        .expect("error while querying input configs");
-    let supported_input_config = supported_input_configs_range
-        .next()
-        .expect("no supported input config?!")
-        .with_max_sample_rate();
+    // We'll try and use the same configuration between streams to keep it simple.
+    let config: cpal::StreamConfig = input_device.default_input_config()?.into();
 
-    let mut extra_config_opt = supported_input_configs_range.next();
-    while extra_config_opt != None {
-        let extra_config = extra_config_opt
-            .expect("error while iterating over supported configs")
-            .with_max_sample_rate();
-        println!("{:?}", extra_config);
-        extra_config_opt = supported_input_configs_range.next();
+    // Create a delay in case the input and output devices aren't synced.
+    let latency_frames = (LATENCY_MS / 1_000.0) * config.sample_rate.0 as f32;
+    let latency_samples = latency_frames as usize * config.channels as usize;
+
+    // The buffer to share samples
+    let ring = RingBuffer::new(latency_samples * 2);
+    let (mut producer, mut consumer) = ring.split();
+
+    // Fill the samples with 0.0 equal to the length of the delay.
+    for _ in 0..latency_samples {
+        // The ring buffer has twice as much space as necessary to add latency here,
+        // so this should never fail
+        producer.push(0.0).unwrap();
     }
-    println!();
 
-    let mut supported_configs_range = output_device
-        .supported_output_configs()
-        .expect("error while querying configs");
-    let supported_config = supported_configs_range
-        .next()
-        .expect("no supported config?!")
-        .with_max_sample_rate();
-
-    let mut extra_config_opt = supported_configs_range.next();
-    while extra_config_opt != None {
-        let extra_config = extra_config_opt
-            .expect("error while iterating over supported configs")
-            .with_max_sample_rate();
-        println!("{:?}", extra_config);
-        extra_config_opt = supported_configs_range.next();
-    }
-    println!();
-
-    println!("supported_input_config was: {:?}", supported_input_config);
-    println!("supported_config was: {:?}", supported_config);
-
-    // use cpal::{Data, Sample, SampleFormat};
-    use cpal::{Sample, SampleFormat};
-    let err_fn = |err| eprintln!("an error occurred on the output audio stream: {}", err);
-    let sample_format = supported_config.sample_format();
-    // TODO: check against supported_input_config.sample_format();
-
-    let mut input_config: cpal::StreamConfig = supported_input_config.into();
-    // Overriding values anyway:
-    input_config.channels = 1;
-    input_config.sample_rate = cpal::SampleRate(44100);
-    println!("using input_config: {:?}", input_config);
-
-    let mut config: cpal::StreamConfig = supported_config.into();
-    // Overriding values anyway:
-    config.channels = 1;
-    config.sample_rate = cpal::SampleRate(44100);
-    println!("using config: {:?}", config);
-
-    let _stream = match sample_format {
-        SampleFormat::F32 => {
-            // input_device.build_input_stream(&config, read_samples::<f32>, err_fn)
-            output_device.build_output_stream(&config, write_silence::<f32>, err_fn)
+    let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
+        let mut output_fell_behind = false;
+        for &sample in data {
+            if producer.push(sample).is_err() {
+                output_fell_behind = true;
+            }
         }
-        SampleFormat::I16 => {
-            // input_device.build_input_stream(&config, read_samples::<i16>, err_fn)
-            output_device.build_output_stream(&config, write_silence::<i16>, err_fn)
-        }
-        SampleFormat::U16 => {
-            // input_device.build_input_stream(&config, read_samples::<u16>, err_fn)
-            output_device.build_output_stream(&config, write_silence::<u16>, err_fn)
+        if output_fell_behind {
+            eprintln!("output stream fell behind: try increasing latency");
         }
     };
-    if let Err(e) = _stream {
-        println!("Error from build_output_stream: {}", e);
-        // TODO: find a good way to terminate.
-        // return ();
-        panic!();
-    }
-    let _stream = _stream.unwrap();
 
-    fn write_silence<T: Sample>(data: &mut [T], _: &cpal::OutputCallbackInfo) {
-        for sample in data.iter_mut() {
-            *sample = Sample::from(&0.0);
+    let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        let mut input_fell_behind = false;
+        for sample in data {
+            *sample = match consumer.pop() {
+                Some(s) => s,
+                None => {
+                    input_fell_behind = true;
+                    0.0
+                }
+            };
         }
-    }
+        if input_fell_behind {
+            eprintln!("input stream fell behind: try increasing latency");
+        }
+    };
+
+    // Build streams.
+    println!(
+        "Attempting to build both streams with f32 samples and `{:?}`.",
+        config
+    );
+    let input_stream = input_device.build_input_stream(&config, input_data_fn, err_fn)?;
+    let output_stream = output_device.build_output_stream(&config, output_data_fn, err_fn)?;
+    println!("Successfully built streams.");
+
+    // Play the streams.
+    println!(
+        "Starting the input and output streams with `{}` milliseconds of latency.",
+        LATENCY_MS
+    );
+    input_stream.play()?;
+    output_stream.play()?;
 
     env_logger::init();
 
@@ -252,4 +263,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     });
+}
+
+fn err_fn(err: cpal::StreamError) {
+    eprintln!("an error occurred on stream: {}", err);
 }
