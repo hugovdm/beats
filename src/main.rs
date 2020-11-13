@@ -4,11 +4,24 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::RingBuffer;
 
-const LATENCY_MS: f32 = 150.0;
-
 use wgpu_glyph::{ab_glyph, GlyphBrushBuilder, Section, Text};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut latency_ms: f32 = 1000.0;
+    {
+        let mut next_is_delay = false;
+        for arg in &args {
+            if next_is_delay {
+                latency_ms = arg.parse().unwrap();
+                next_is_delay = false;
+            } else if arg == "--delay" {
+                next_is_delay = true;
+            }
+        }
+    }
+    let latency_ms = latency_ms;
+
     // Conditionally compile with jack if the feature is specified.
     #[cfg(all(
         any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd"),
@@ -16,10 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))]
     // Manually check for flags. Can be passed through cargo with -- e.g.
     // cargo run --release --example beep --features jack -- --jack
-    let host = if std::env::args()
-        .collect::<String>()
-        .contains(&String::from("--jack"))
-    {
+    let host = if args.contains(&String::from("--jack")) {
         cpal::host_from_id(cpal::available_hosts()
             .into_iter()
             .find(|id| *id == cpal::HostId::Jack)
@@ -43,14 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_device = host
         .default_output_device()
         .expect("failed to get default output device");
-    println!("Using default input device: \"{}\"", input_device.name()?);
-    println!("Using default output device: \"{}\"", output_device.name()?);
+    println!("Using default input device: \"{}\", host: \"{:?}\"", input_device.name()?, host.id());
+    println!("Using default output device: \"{}\", host: \"{:?}\"", output_device.name()?, host.id());
 
     // We'll try and use the same configuration between streams to keep it simple.
     let config: cpal::StreamConfig = input_device.default_input_config()?.into();
 
     // Create a delay in case the input and output devices aren't synced.
-    let latency_frames = (LATENCY_MS / 1_000.0) * config.sample_rate.0 as f32;
+    let latency_frames = (latency_ms / 1_000.0) * config.sample_rate.0 as f32;
     let latency_samples = latency_frames as usize * config.channels as usize;
 
     // The buffer to share samples
@@ -104,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Play the streams.
     println!(
         "Starting the input and output streams with `{}` milliseconds of latency.",
-        LATENCY_MS
+        latency_ms
     );
     input_stream.play()?;
     output_stream.play()?;
