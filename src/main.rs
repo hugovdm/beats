@@ -53,8 +53,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_device = host
         .default_output_device()
         .expect("failed to get default output device");
-    println!("Using default input device: \"{}\", host: \"{:?}\"", input_device.name()?, host.id());
-    println!("Using default output device: \"{}\", host: \"{:?}\"", output_device.name()?, host.id());
+    println!(
+        "Using default input device: \"{}\", host: \"{:?}\"",
+        input_device.name()?,
+        host.id()
+    );
+    println!(
+        "Using default output device: \"{}\", host: \"{:?}\"",
+        output_device.name()?,
+        host.id()
+    );
 
     // We'll try and use the same configuration between streams to keep it simple.
     let config: cpal::StreamConfig = input_device.default_input_config()?.into();
@@ -169,12 +177,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Prepare glyph_brush
-    let inconsolata = ab_glyph::FontArc::try_from_slice(include_bytes!(
-        "Inconsolata-Regular.ttf"
-    ))?;
+    let inconsolata = ab_glyph::FontArc::try_from_slice(include_bytes!("Inconsolata-Regular.ttf"))?;
 
-    let mut glyph_brush = GlyphBrushBuilder::using_font(inconsolata)
-        .build(&device, render_format);
+    let mut glyph_brush = GlyphBrushBuilder::using_font(inconsolata).build(&device, render_format);
 
     // Render loop
     window.request_redraw();
@@ -204,37 +209,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             winit::event::Event::RedrawRequested { .. } => {
                 // Get a command encoder for the current frame
-                let mut encoder = device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: Some("Redraw"),
-                    },
-                );
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Redraw"),
+                });
 
                 // Get the next frame
-                let frame =
-                    swap_chain.get_next_texture().expect("Get next frame");
+                let frame = swap_chain.get_next_texture().expect("Get next frame");
 
                 // Clear frame
                 {
-                    let _ = encoder.begin_render_pass(
-                        &wgpu::RenderPassDescriptor {
-                            color_attachments: &[
-                                wgpu::RenderPassColorAttachmentDescriptor {
-                                    attachment: &frame.view,
-                                    resolve_target: None,
-                                    load_op: wgpu::LoadOp::Clear,
-                                    store_op: wgpu::StoreOp::Store,
-                                    clear_color: wgpu::Color {
-                                        r: 0.4,
-                                        g: 0.4,
-                                        b: 0.4,
-                                        a: 1.0,
-                                    },
-                                },
-                            ],
-                            depth_stencil_attachment: None,
-                        },
-                    );
+                    let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
+                            attachment: &frame.view,
+                            resolve_target: None,
+                            load_op: wgpu::LoadOp::Clear,
+                            store_op: wgpu::StoreOp::Store,
+                            clear_color: wgpu::Color {
+                                r: 0.4,
+                                g: 0.4,
+                                b: 0.4,
+                                a: 1.0,
+                            },
+                        }],
+                        depth_stencil_attachment: None,
+                    });
                 }
 
                 glyph_brush.queue(Section {
@@ -257,13 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Draw the text!
                 glyph_brush
-                    .draw_queued(
-                        &device,
-                        &mut encoder,
-                        &frame.view,
-                        size.width,
-                        size.height,
-                    )
+                    .draw_queued(&device, &mut encoder, &frame.view, size.width, size.height)
                     .expect("Draw queued");
 
                 queue.submit(&[encoder.finish()]);
