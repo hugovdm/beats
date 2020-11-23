@@ -46,6 +46,11 @@ Things I'm likely to do next:
   work as dreamed.)
 
 ## Running
+Use of Rocket means we need to use nightly Rust rather than stable:
+```
+$ rustup override set nightly
+```
+
 With 200 milliseconds feedback latency:
 ```
 cargo run --release -- --delay 200
