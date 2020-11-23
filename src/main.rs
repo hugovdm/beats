@@ -4,7 +4,84 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::RingBuffer;
 
+use std::sync::mpsc::channel;
+use std::thread;
+
 use wgpu_glyph::{ab_glyph, GlyphBrushBuilder, Section, Text};
+
+const MAX_CHANNELS: usize = 2;
+struct FrameStats {
+    channels: cpal::ChannelCount,
+    max: [f32; MAX_CHANNELS as usize],
+    max_cnt: [u32; MAX_CHANNELS as usize],
+    acc: [f32; MAX_CHANNELS as usize],
+    cnt: [u32; MAX_CHANNELS as usize],
+}
+impl FrameStats {
+    fn new(channels: cpal::ChannelCount) -> FrameStats {
+        FrameStats {
+            channels: channels,
+            max: [0.0; MAX_CHANNELS],
+            max_cnt: [0; MAX_CHANNELS],
+            acc: [0.0; MAX_CHANNELS],
+            cnt: [0; MAX_CHANNELS],
+        }
+    }
+
+    // Partially generic version of the function below:
+    //
+    // fn consume_frame<'a, I>(&mut self, feed: &mut I) -> bool
+    // where
+    //     I: Iterator<Item = &'a f32>,
+    // { ... }
+    //
+    // Parameterising out f32 might allow this to function with e.g. u16 or u32
+    // too. However it should be parameterised out at the FrameStats level.
+    fn consume_frame<'a>(&mut self, feed: &mut impl Iterator<Item = &'a f32>) -> bool {
+        for c in 0..self.channels as usize {
+            match feed.next() {
+                Some(s) => {
+                    if c > MAX_CHANNELS {
+                        continue;
+                    }
+                    let ss = s * s;
+                    self.acc[c] += ss;
+                    self.cnt[c] += 1;
+                    if ss > self.max[c] {
+                        self.max[c] = ss;
+                        self.max_cnt[c] = 1;
+                    } else if ss == self.max[c] {
+                        self.max_cnt[c] += 1;
+                    }
+                }
+                None => return false,
+            }
+        }
+        return true;
+    }
+}
+
+fn print_stats(fs: FrameStats) {
+    for c in 0..fs.channels as usize {
+        print!(" | ");
+        let rms = (fs.acc[c] / fs.cnt[c] as f32).sqrt();
+        print!(
+            "max: {:.3}, max_cnt: {:3}, rms: {:.3}, cnt: {} ",
+            fs.max[c].sqrt(),
+            fs.max_cnt[c],
+            rms,
+            fs.cnt[c]
+        );
+        let bar_len = (50.0 * rms) as u32;
+        for _ in 0..bar_len {
+            print!("#");
+        }
+        for _ in bar_len..50 {
+            print!(" ");
+        }
+    }
+    println!();
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -82,7 +159,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         producer.push(0.0).unwrap();
     }
 
+    let (sender, receiver) = channel();
+    thread::spawn(move || {
+        while let Ok(fs) = receiver.recv() {
+            print_stats(fs);
+        }
+    });
+
+    let channels = config.channels;
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
+        let mut fs = FrameStats::new(channels);
+        let mut iter = data.iter();
+        while fs.consume_frame(&mut iter) {}
+        sender.send(fs).unwrap();
+
         let mut output_fell_behind = false;
         for &sample in data {
             if producer.push(sample).is_err() {
