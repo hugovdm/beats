@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 
 const MAX_CHANNELS: usize = 2;
+#[derive(Clone)]
 struct FrameStats {
     channels: cpal::ChannelCount,
     max: [f32; MAX_CHANNELS as usize],
@@ -88,6 +89,10 @@ impl FrameStats {
     }
 }
 
+enum Request {
+    StatsRequest { resp: mpsc::Sender<FrameStats> },
+}
+
 use std::sync::{Arc, RwLock};
 const CHUNK_SIZE: usize = 8192;
 const MAX_CHUNKS: usize = 1024;
@@ -102,6 +107,7 @@ fn new_chunk() -> Chunk {
 }
 struct Coordinator {
     chunk_receiver: mpsc::Receiver<Chunk>,
+    request_receiver: mpsc::Receiver<Request>,
     frame_stats_receiver: mpsc::Receiver<FrameStats>,
     chunks: Vec<Chunk>,
     chunks_pos: usize,
@@ -111,10 +117,12 @@ struct Coordinator {
 impl Coordinator {
     fn new(
         chunk_receiver: mpsc::Receiver<Chunk>,
+        request_receiver: mpsc::Receiver<Request>,
         frame_stats_receiver: mpsc::Receiver<FrameStats>,
     ) -> Coordinator {
         Coordinator {
             chunk_receiver: chunk_receiver,
+            request_receiver: request_receiver,
             frame_stats_receiver: frame_stats_receiver,
             chunks: Vec::with_capacity(MAX_CHUNKS),
             chunks_pos: 0,
@@ -128,21 +136,38 @@ impl Coordinator {
         // code?
         //
         // (Simplicity of current code's approach: the thread owns all of &self.)
-        while let Ok(chunk) = self.chunk_receiver.try_recv() {
-            self.chunks_pos = self.chunks_pos + 1;
-            if self.chunks_pos >= self.chunks.len() {
-                self.chunks.push(chunk);
-            } else {
-                self.chunks[self.chunks_pos] = chunk;
+
+        // FIXME: Is it possible to select between multiple channels: block
+        // until any of them have received data? The loop is currently very
+        // hacky: we do a blocking read for frame stats, relying on them being
+        // sent regularly (unlike requests). We also expect they're sent more
+        // often than chunks.
+        loop {
+            while let Ok(chunk) = self.chunk_receiver.try_recv() {
+                self.chunks_pos = self.chunks_pos + 1;
+                if self.chunks_pos >= self.chunks.len() {
+                    self.chunks.push(chunk);
+                } else {
+                    self.chunks[self.chunks_pos] = chunk;
+                }
             }
-        }
-        while let Ok(fs) = self.frame_stats_receiver.recv() {
-            fs.print_stats();
-            self.stats_pos = self.stats_pos + 1;
-            if self.stats_pos >= self.stats.len() {
-                self.stats.push(fs);
-            } else {
-                self.stats[self.stats_pos] = fs;
+            while let Ok(req) = self.request_receiver.try_recv() {
+                match req {
+                    Request::StatsRequest { resp } => {
+                        resp.send(self.stats[self.stats_pos - 1].clone()).unwrap()
+                    }
+                }
+            }
+            match self.frame_stats_receiver.recv() {
+                Ok(fs) => {
+                    self.stats_pos = self.stats_pos + 1;
+                    if self.stats_pos >= self.stats.len() {
+                        self.stats.push(fs);
+                    } else {
+                        self.stats[self.stats_pos] = fs;
+                    }
+                }
+                Err(why) => panic!("{:?}", why),
             }
         }
     }
@@ -226,7 +251,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (chunk_sender, chunk_receiver) = mpsc::channel();
     let (sender, receiver) = mpsc::channel();
-    let mut coordinator = Coordinator::new(chunk_receiver, receiver);
+    let (req_sender, req_receiver) = mpsc::channel();
+    let mut coordinator = Coordinator::new(chunk_receiver, req_receiver, receiver);
     thread::spawn(move || coordinator.run());
 
     let channels = config.channels;
@@ -238,21 +264,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chunk = new_chunk();
     let mut sample_count: usize = 0;
     let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
-        println!("input count {}    info: {:?}", data.len(), inpinf);
+        // TODO: move to stats that are available on-demand:
+        // println!("input count {}    info: {:?}", data.len(), inpinf);
         if previnp_callback != None && previnp_capture != None {
-            println!(
-                "input timestamp diffs callback: {:?}, capture: {:?}",
-                inpinf
-                    .timestamp()
-                    .callback
-                    .duration_since(&previnp_callback.unwrap())
-                    .unwrap(),
-                inpinf
-                    .timestamp()
-                    .capture
-                    .duration_since(&previnp_capture.unwrap())
-                    .unwrap(),
-            );
+            // println!(
+            //     "input timestamp diffs callback: {:?}, capture: {:?}",
+            //     inpinf
+            //         .timestamp()
+            //         .callback
+            //         .duration_since(&previnp_callback.unwrap())
+            //         .unwrap(),
+            //     inpinf
+            //         .timestamp()
+            //         .capture
+            //         .duration_since(&previnp_capture.unwrap())
+            //         .unwrap(),
+            // );
         }
         previnp_callback = Some(inpinf.timestamp().callback);
         previnp_capture = Some(inpinf.timestamp().capture);
@@ -285,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
-        println!("output count {} info {:?}", data.len(), outinf);
+        // println!("output count {} info {:?}", data.len(), outinf);
         let mut input_fell_behind = false;
         for sample in data {
             *sample = match consumer.pop() {
@@ -317,6 +344,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     input_stream.play()?;
     output_stream.play()?;
+
+    use std::time::Duration;
+    thread::spawn(move || {
+        let (resp_sender, resp_receiver) = mpsc::channel();
+        req_sender
+            .send(Request::StatsRequest {
+                resp: resp_sender.clone(),
+            })
+            .unwrap();
+        while let Ok(fs) = resp_receiver.recv() {
+            fs.print_stats();
+            thread::sleep(Duration::from_millis(100));
+            req_sender
+                .send(Request::StatsRequest {
+                    resp: resp_sender.clone(),
+                })
+                .unwrap();
+        }
+    });
 
     rocket::ignite().mount("/", routes![index]).launch();
 
