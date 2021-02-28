@@ -9,7 +9,7 @@ extern crate rocket;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::RingBuffer;
 
-use std::sync::mpsc::channel;
+use std::sync::mpsc;
 use std::thread;
 
 const MAX_CHANNELS: usize = 2;
@@ -31,6 +31,8 @@ impl FrameStats {
         }
     }
 
+    /// Collects statistics from `feed`.
+    //
     // Partially generic version of the function below:
     //
     // fn consume_frame<'a, I>(&mut self, feed: &mut I) -> bool
@@ -62,28 +64,66 @@ impl FrameStats {
         }
         return true;
     }
+
+    fn print_stats(&self) {
+        for c in 0..self.channels as usize {
+            print!(" | ");
+            let rms = (self.acc[c] / self.cnt[c] as f32).sqrt();
+            print!(
+                "max: {:.3}, max_cnt: {:3}, rms: {:.3}, cnt: {} ",
+                self.max[c].sqrt(),
+                self.max_cnt[c],
+                rms,
+                self.cnt[c]
+            );
+            let bar_len = (50.0 * rms) as u32;
+            for _ in 0..bar_len {
+                print!("#");
+            }
+            for _ in bar_len..50 {
+                print!(" ");
+            }
+        }
+        println!();
+    }
 }
 
-fn print_stats(fs: FrameStats) {
-    for c in 0..fs.channels as usize {
-        print!(" | ");
-        let rms = (fs.acc[c] / fs.cnt[c] as f32).sqrt();
-        print!(
-            "max: {:.3}, max_cnt: {:3}, rms: {:.3}, cnt: {} ",
-            fs.max[c].sqrt(),
-            fs.max_cnt[c],
-            rms,
-            fs.cnt[c]
-        );
-        let bar_len = (50.0 * rms) as u32;
-        for _ in 0..bar_len {
-            print!("#");
-        }
-        for _ in bar_len..50 {
-            print!(" ");
+use std::sync::Arc;
+const MAX_STATS: usize = 100;
+struct Coordinator {
+    frame_stats_receiver: mpsc::Receiver<FrameStats>,
+    stats: Vec<Arc<FrameStats>>,
+    stats_pos: usize,
+}
+impl Coordinator {
+    fn new(
+        frame_stats_receiver: mpsc::Receiver<FrameStats>,
+    ) -> Coordinator {
+        Coordinator {
+            frame_stats_receiver: frame_stats_receiver,
+            stats: Vec::with_capacity(MAX_STATS),
+            stats_pos: 0,
         }
     }
-    println!();
+
+    // Review: how do I make it clear in the function signature whether
+    // frame_stats_receiver is moved?
+    fn run(&mut self) {
+        // Review: is it possible to move self.frame_stats_receiver into the
+        // thread lambda?
+        //
+        // Is it possible to call thread::spawn here instead of in the calling
+        // code? (By calling in the calling code, we do already own &self here.)
+        while let Ok(fs) = self.frame_stats_receiver.recv() {
+            fs.print_stats();
+            self.stats_pos = self.stats_pos + 1;
+            if self.stats_pos >= self.stats.len() {
+                self.stats.push(Arc::new(fs));
+            } else {
+                self.stats[self.stats_pos] = Arc::new(fs);
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -162,15 +202,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         producer.push(0.0).unwrap();
     }
 
-    let (sender, receiver) = channel();
-    thread::spawn(move || {
-        while let Ok(fs) = receiver.recv() {
-            print_stats(fs);
-        }
-    });
+    let (sender, receiver) = mpsc::channel::<FrameStats>();
+    let mut coordinator = Coordinator::new(receiver);
+    thread::spawn(move || coordinator.run());
 
     let channels = config.channels;
-    let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
+
+    let mut previnp_callback: Option<cpal::StreamInstant> = None;
+    let mut previnp_capture: Option<cpal::StreamInstant> = None;
+    let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
+        println!("input count {}    info: {:?}", data.len(), inpinf);
+        if previnp_callback != None && previnp_capture != None {
+            println!(
+                "input timestamp diffs callback: {:?}, capture: {:?}",
+                inpinf
+                    .timestamp()
+                    .callback
+                    .duration_since(&previnp_callback.unwrap())
+                    .unwrap(),
+                inpinf
+                    .timestamp()
+                    .capture
+                    .duration_since(&previnp_capture.unwrap())
+                    .unwrap(),
+            );
+        }
+        previnp_callback = Some(inpinf.timestamp().callback);
+        previnp_capture = Some(inpinf.timestamp().capture);
         let mut fs = FrameStats::new(channels);
         let mut iter = data.iter();
         while fs.consume_frame(&mut iter) {}
@@ -187,7 +245,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+    let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
+        println!("output count {} info {:?}", data.len(), outinf);
         let mut input_fell_behind = false;
         for sample in data {
             *sample = match consumer.pop() {
