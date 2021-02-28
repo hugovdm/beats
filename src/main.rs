@@ -88,39 +88,61 @@ impl FrameStats {
     }
 }
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+const CHUNK_SIZE: usize = 8192;
+const MAX_CHUNKS: usize = 1024;
 const MAX_STATS: usize = 100;
+// Review(RwLock): we want to send the Arc between threads, so we need an Arc<T>
+// with T satisfying Send. However, we know that prior to sending, there's only
+// one reference (RW), and after sending we need it read-only. Can we not
+// simplify somehow?
+type Chunk = Arc<RwLock<[f32; CHUNK_SIZE]>>;
+fn new_chunk() -> Chunk {
+    Arc::new(RwLock::new([0.0; CHUNK_SIZE]))
+}
 struct Coordinator {
+    chunk_receiver: mpsc::Receiver<Chunk>,
     frame_stats_receiver: mpsc::Receiver<FrameStats>,
-    stats: Vec<Arc<FrameStats>>,
+    chunks: Vec<Chunk>,
+    chunks_pos: usize,
+    stats: Vec<FrameStats>,
     stats_pos: usize,
 }
 impl Coordinator {
     fn new(
+        chunk_receiver: mpsc::Receiver<Chunk>,
         frame_stats_receiver: mpsc::Receiver<FrameStats>,
     ) -> Coordinator {
         Coordinator {
+            chunk_receiver: chunk_receiver,
             frame_stats_receiver: frame_stats_receiver,
+            chunks: Vec::with_capacity(MAX_CHUNKS),
+            chunks_pos: 0,
             stats: Vec::with_capacity(MAX_STATS),
             stats_pos: 0,
         }
     }
 
-    // Review: how do I make it clear in the function signature whether
-    // frame_stats_receiver is moved?
     fn run(&mut self) {
-        // Review: is it possible to move self.frame_stats_receiver into the
-        // thread lambda?
-        //
         // Is it possible to call thread::spawn here instead of in the calling
-        // code? (By calling in the calling code, we do already own &self here.)
+        // code?
+        //
+        // (Simplicity of current code's approach: the thread owns all of &self.)
+        while let Ok(chunk) = self.chunk_receiver.try_recv() {
+            self.chunks_pos = self.chunks_pos + 1;
+            if self.chunks_pos >= self.chunks.len() {
+                self.chunks.push(chunk);
+            } else {
+                self.chunks[self.chunks_pos] = chunk;
+            }
+        }
         while let Ok(fs) = self.frame_stats_receiver.recv() {
             fs.print_stats();
             self.stats_pos = self.stats_pos + 1;
             if self.stats_pos >= self.stats.len() {
-                self.stats.push(Arc::new(fs));
+                self.stats.push(fs);
             } else {
-                self.stats[self.stats_pos] = Arc::new(fs);
+                self.stats[self.stats_pos] = fs;
             }
         }
     }
@@ -202,14 +224,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         producer.push(0.0).unwrap();
     }
 
-    let (sender, receiver) = mpsc::channel::<FrameStats>();
-    let mut coordinator = Coordinator::new(receiver);
+    let (chunk_sender, chunk_receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel();
+    let mut coordinator = Coordinator::new(chunk_receiver, receiver);
     thread::spawn(move || coordinator.run());
 
     let channels = config.channels;
 
     let mut previnp_callback: Option<cpal::StreamInstant> = None;
     let mut previnp_capture: Option<cpal::StreamInstant> = None;
+    // TODO: use new_uninit() for efficiency, bundling count and chunk into a
+    // struct.
+    let mut chunk = new_chunk();
+    let mut sample_count: usize = 0;
     let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
         println!("input count {}    info: {:?}", data.len(), inpinf);
         if previnp_callback != None && previnp_capture != None {
@@ -239,6 +266,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if producer.push(sample).is_err() {
                 output_fell_behind = true;
             }
+            if sample_count >= CHUNK_SIZE {
+                chunk_sender.send(chunk.clone()).unwrap();
+                chunk = new_chunk();
+                sample_count = 0;
+            }
+            // Review(RwLock): Is grabbing the write lock efficient? Instead of
+            // grabbing a write lock with every sample, can we not somehow hold
+            // a RW reference until we're ready to send, then release the
+            // write-lock / turn it read-only as we send it?
+            let mut c = chunk.write().unwrap();
+            c[sample_count] = sample;
+            sample_count = sample_count + 1;
         }
         if output_fell_behind {
             eprintln!("output stream fell behind: try increasing latency");
