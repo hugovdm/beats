@@ -93,17 +93,13 @@ enum Request {
     StatsRequest { resp: mpsc::Sender<FrameStats> },
 }
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 const CHUNK_SIZE: usize = 8192;
 const MAX_CHUNKS: usize = 1024;
 const MAX_STATS: usize = 100;
-// Review(RwLock): we want to send the Arc between threads, so we need an Arc<T>
-// with T satisfying Send. However, we know that prior to sending, there's only
-// one reference (RW), and after sending we need it read-only. Can we not
-// simplify somehow?
-type Chunk = Arc<RwLock<[f32; CHUNK_SIZE]>>;
+type Chunk = Arc<[f32; CHUNK_SIZE]>;
 fn new_chunk() -> Chunk {
-    Arc::new(RwLock::new([0.0; CHUNK_SIZE]))
+    Arc::new([0.0; CHUNK_SIZE])
 }
 struct Coordinator {
     chunk_receiver: mpsc::Receiver<Chunk>,
@@ -298,11 +294,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chunk = new_chunk();
                 sample_count = 0;
             }
-            // Review(RwLock): Is grabbing the write lock efficient? Instead of
-            // grabbing a write lock with every sample, can we not somehow hold
-            // a RW reference until we're ready to send, then release the
-            // write-lock / turn it read-only as we send it?
-            let mut c = chunk.write().unwrap();
+            // Review: is get_mut(...).unwrap() cheap? Can we somehow move
+            // such binding to outside the for-loop, then somehow unbind
+            // when we want to send(chunk.clone())?
+            let c = Arc::get_mut(&mut chunk).unwrap();
             c[sample_count] = sample;
             sample_count = sample_count + 1;
         }
