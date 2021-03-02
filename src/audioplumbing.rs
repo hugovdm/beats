@@ -1,5 +1,162 @@
+use std::sync::mpsc;
+use std::sync::Arc;
+
+pub enum Request {
+    StatsRequest { resp: mpsc::Sender<FrameStats> },
+}
+
 pub fn err_fn(err: cpal::StreamError) {
     eprintln!("an error occurred on stream: {}", err);
+}
+
+pub struct DumbLooper<'a> {
+    // Change to i32? 1ms is already only 48 samples?
+    input_device: &'a cpal::Device,
+    output_device: &'a cpal::Device,
+    config: &'a cpal::StreamConfig,
+    delay_ms: f32,
+    input_stream: Option<cpal::Stream>,
+    output_stream: Option<cpal::Stream>,
+}
+use cpal;
+impl<'a> DumbLooper<'a> {
+    pub fn new(
+        input_device: &'a cpal::Device,
+        output_device: &'a cpal::Device,
+        config: &'a cpal::StreamConfig,
+        delay_ms: f32,
+    ) -> Self {
+        Self {
+            input_device,
+            output_device,
+            config,
+            delay_ms,
+            input_stream: None,
+            output_stream: None,
+        }
+    }
+    pub fn play(
+        &mut self,
+        chunk_sender: mpsc::Sender<Chunk>,
+        fs_sender: mpsc::Sender<FrameStats>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Create a delay in case the input and output devices aren't synced.
+        let channels = self.config.channels;
+        let latency_frames = (self.delay_ms / 1_000.0) * self.config.sample_rate.0 as f32;
+        let latency_samples = latency_frames as usize * channels as usize;
+
+        // The buffer to share samples
+        use ringbuf::RingBuffer;
+        let ring = RingBuffer::new(latency_samples * 2);
+        let (mut producer, mut consumer) = ring.split();
+
+        // Fill the samples with 0.0 equal to the length of the delay.
+        for _ in 0..latency_samples {
+            // The ring buffer has twice as much space as necessary to add latency here,
+            // so this should never fail
+            producer.push(0.0).unwrap();
+        }
+
+        let mut previnp_callback: Option<cpal::StreamInstant> = None;
+        let mut previnp_capture: Option<cpal::StreamInstant> = None;
+        // TODO: use new_uninit() for efficiency, bundling count and chunk into a
+        // struct.
+        let mut chunk = new_chunk();
+        let mut sample_count: usize = 0;
+        let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
+            // TODO: move to stats that are available on-demand:
+            // println!("input count {}    info: {:?}", data.len(), inpinf);
+            if previnp_callback != None && previnp_capture != None {
+                // println!(
+                //     "input timestamp diffs callback: {:?}, capture: {:?}",
+                //     inpinf
+                //         .timestamp()
+                //         .callback
+                //         .duration_since(&previnp_callback.unwrap())
+                //         .unwrap(),
+                //     inpinf
+                //         .timestamp()
+                //         .capture
+                //         .duration_since(&previnp_capture.unwrap())
+                //         .unwrap(),
+                // );
+            }
+            previnp_callback = Some(inpinf.timestamp().callback);
+            previnp_capture = Some(inpinf.timestamp().capture);
+            let mut fs = FrameStats::new(channels);
+            let mut iter = data.iter();
+            while fs.consume_frame(&mut iter) {}
+            fs_sender.send(fs).unwrap();
+
+            let mut output_fell_behind = false;
+            for &sample in data {
+                if producer.push(sample).is_err() {
+                    output_fell_behind = true;
+                }
+                if sample_count >= CHUNK_SIZE {
+                    chunk_sender.send(chunk.clone()).unwrap();
+                    chunk = new_chunk();
+                    sample_count = 0;
+                }
+                // Review: is get_mut(...).unwrap() cheap? Can we somehow move
+                // such binding to outside the for-loop, then somehow unbind
+                // when we want to send(chunk.clone())?
+                let c = Arc::get_mut(&mut chunk).unwrap();
+                c[sample_count] = sample;
+                sample_count = sample_count + 1;
+            }
+            if output_fell_behind {
+                eprintln!("output stream fell behind: try increasing latency");
+            }
+        };
+
+        let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
+            // println!("output count {} info {:?}", data.len(), outinf);
+            let mut input_fell_behind = false;
+            for sample in data {
+                *sample = match consumer.pop() {
+                    Some(s) => s,
+                    None => {
+                        input_fell_behind = true;
+                        0.0
+                    }
+                };
+            }
+            if input_fell_behind {
+                eprintln!("input stream fell behind: try increasing latency");
+            }
+        };
+
+        // Build streams.
+        println!(
+            "Attempting to build both streams with f32 samples and `{:?}`.",
+            self.config
+        );
+
+        use cpal::traits::DeviceTrait;
+        self.input_stream = Some(self.input_device.build_input_stream(
+            self.config,
+            input_data_fn,
+            err_fn,
+        )?);
+        self.output_stream = Some(self.output_device.build_output_stream(
+            self.config,
+            output_data_fn,
+            err_fn,
+        )?);
+        println!("Successfully built streams.");
+
+        // Play the streams.
+        println!(
+            "Starting the input and output streams with `{}` milliseconds of latency.",
+            self.delay_ms,
+        );
+        use cpal::traits::StreamTrait;
+        self.input_stream.as_ref().unwrap().play()?;
+        self.output_stream.as_ref().unwrap().play()?;
+
+        Ok(())
+    }
 }
 
 const MAX_CHANNELS: usize = 2;
@@ -80,12 +237,6 @@ impl FrameStats {
     }
 }
 
-use std::sync::mpsc;
-pub enum Request {
-    StatsRequest { resp: mpsc::Sender<FrameStats> },
-}
-
-use std::sync::Arc;
 pub const CHUNK_SIZE: usize = 8192;
 const MAX_CHUNKS: usize = 1024;
 const MAX_STATS: usize = 100;

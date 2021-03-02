@@ -5,7 +5,7 @@
 #[macro_use]
 extern crate rocket;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use std::thread;
 
 mod audioplumbing;
@@ -72,122 +72,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // We'll try and use the same configuration between streams to keep it simple.
     let config: cpal::StreamConfig = input_device.default_input_config()?.into();
 
-    // Create a delay in case the input and output devices aren't synced.
-    let latency_frames = (latency_ms / 1_000.0) * config.sample_rate.0 as f32;
-    let latency_samples = latency_frames as usize * config.channels as usize;
-
-    // The buffer to share samples
-    use ringbuf::RingBuffer;
-    let ring = RingBuffer::new(latency_samples * 2);
-    let (mut producer, mut consumer) = ring.split();
-
-    // Fill the samples with 0.0 equal to the length of the delay.
-    for _ in 0..latency_samples {
-        // The ring buffer has twice as much space as necessary to add latency here,
-        // so this should never fail
-        producer.push(0.0).unwrap();
-    }
-
     use std::sync::mpsc;
     let (chunk_sender, chunk_receiver) = mpsc::channel();
-    let (sender, receiver) = mpsc::channel();
+    let (fs_sender, fs_receiver) = mpsc::channel();
     // Review: why can we pass a SyncSender to Rocket's .manage() but not a Sender?
     // let (req_sender, req_receiver) = mpsc::channel();
     let (req_sender, req_receiver) = mpsc::sync_channel(100);
-    let mut coordinator = audioplumbing::Coordinator::new(chunk_receiver, req_receiver, receiver);
+    let mut coordinator =
+        audioplumbing::Coordinator::new(chunk_receiver, req_receiver, fs_receiver);
     thread::spawn(move || coordinator.run());
 
-    let channels = config.channels;
-
-    let mut previnp_callback: Option<cpal::StreamInstant> = None;
-    let mut previnp_capture: Option<cpal::StreamInstant> = None;
-    // TODO: use new_uninit() for efficiency, bundling count and chunk into a
-    // struct.
-    let mut chunk = audioplumbing::new_chunk();
-    let mut sample_count: usize = 0;
-    let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
-        // TODO: move to stats that are available on-demand:
-        // println!("input count {}    info: {:?}", data.len(), inpinf);
-        if previnp_callback != None && previnp_capture != None {
-            // println!(
-            //     "input timestamp diffs callback: {:?}, capture: {:?}",
-            //     inpinf
-            //         .timestamp()
-            //         .callback
-            //         .duration_since(&previnp_callback.unwrap())
-            //         .unwrap(),
-            //     inpinf
-            //         .timestamp()
-            //         .capture
-            //         .duration_since(&previnp_capture.unwrap())
-            //         .unwrap(),
-            // );
-        }
-        previnp_callback = Some(inpinf.timestamp().callback);
-        previnp_capture = Some(inpinf.timestamp().capture);
-        let mut fs = audioplumbing::FrameStats::new(channels);
-        let mut iter = data.iter();
-        while fs.consume_frame(&mut iter) {}
-        sender.send(fs).unwrap();
-
-        let mut output_fell_behind = false;
-        for &sample in data {
-            if producer.push(sample).is_err() {
-                output_fell_behind = true;
-            }
-            if sample_count >= audioplumbing::CHUNK_SIZE {
-                chunk_sender.send(chunk.clone()).unwrap();
-                chunk = audioplumbing::new_chunk();
-                sample_count = 0;
-            }
-            // Review: is get_mut(...).unwrap() cheap? Can we somehow move
-            // such binding to outside the for-loop, then somehow unbind
-            // when we want to send(chunk.clone())?
-            use std::sync::Arc;
-            let c = Arc::get_mut(&mut chunk).unwrap();
-            c[sample_count] = sample;
-            sample_count = sample_count + 1;
-        }
-        if output_fell_behind {
-            eprintln!("output stream fell behind: try increasing latency");
-        }
-    };
-
-    let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
-        // println!("output count {} info {:?}", data.len(), outinf);
-        let mut input_fell_behind = false;
-        for sample in data {
-            *sample = match consumer.pop() {
-                Some(s) => s,
-                None => {
-                    input_fell_behind = true;
-                    0.0
-                }
-            };
-        }
-        if input_fell_behind {
-            eprintln!("input stream fell behind: try increasing latency");
-        }
-    };
-
-    // Build streams.
-    println!(
-        "Attempting to build both streams with f32 samples and `{:?}`.",
-        config
-    );
-    let input_stream =
-        input_device.build_input_stream(&config, input_data_fn, audioplumbing::err_fn)?;
-    let output_stream =
-        output_device.build_output_stream(&config, output_data_fn, audioplumbing::err_fn)?;
-    println!("Successfully built streams.");
-
-    // Play the streams.
-    println!(
-        "Starting the input and output streams with `{}` milliseconds of latency.",
-        latency_ms
-    );
-    input_stream.play()?;
-    output_stream.play()?;
+    let mut looper =
+        audioplumbing::DumbLooper::new(&input_device, &output_device, &config, latency_ms);
+    looper.play(chunk_sender.clone(), fs_sender.clone())?;
 
     use std::time::Duration;
     let console_req_sender = req_sender.clone();
