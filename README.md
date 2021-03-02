@@ -83,3 +83,18 @@ slowly growing in volume.)
 To be determined: can this maximum value be found without empirically observing
 the audio system clipping? And does this maximum value apply both to input and
 output equally?
+
+## Design Ideas
+### Sample Rates
+
+Consider the prime factors of some numbers you've seen a lot:
+
+* 48 = 2×2×2×2×3: at 48 kHz, one can divide a millisecond's worth of samples
+  into 16ths, or into 3.
+* 60 = 2×2×3×5: nicely divisible by any integer up to 6, but can be halved only
+  twice. (120? 240? Good if we're not looking at triplets-of-triplets.)
+* 360 = 2×2×2×3×3×5: in case you ever wondered why 360 is a nice number. Not
+  divisible by 7 or 11, but divisible by all other integers up to 12.
+
+When sample-perfect subdivisions are useful, there can be a good reason to make
+a loop a multiple of one of these numbers.
