@@ -18,7 +18,7 @@ pub fn index() -> content::Html<String> {
 }
 
 #[get("/stats")]
-pub fn stats(state: State<SyncSender<audioplumbing::Request>>) -> String {
+pub fn stats(state: State<SyncSender<audioplumbing::Request<f32>>>) -> String {
     let (resp_sender, resp_receiver) = channel();
     state
         .send(audioplumbing::Request::StatsRequest {

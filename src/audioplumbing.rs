@@ -1,11 +1,11 @@
 use std::sync::mpsc;
 use std::sync::Arc;
 
-pub enum Request {
-    StatsRequest { resp: mpsc::Sender<FrameStats> },
+pub enum Request<T> {
+    StatsRequest { resp: mpsc::Sender<FrameStats<T>> },
 }
 
-pub fn err_fn(err: cpal::StreamError) {
+fn err_fn(err: cpal::StreamError) {
     eprintln!("an error occurred on stream: {}", err);
 }
 
@@ -18,7 +18,6 @@ pub struct DumbLooper<'a> {
     input_stream: Option<cpal::Stream>,
     output_stream: Option<cpal::Stream>,
 }
-use cpal;
 impl<'a> DumbLooper<'a> {
     pub fn new(
         input_device: &'a cpal::Device,
@@ -37,8 +36,8 @@ impl<'a> DumbLooper<'a> {
     }
     pub fn play(
         &mut self,
-        chunk_sender: mpsc::Sender<Chunk>,
-        fs_sender: mpsc::Sender<FrameStats>,
+        chunk_sender: mpsc::Sender<Chunk<f32>>,
+        fs_sender: mpsc::Sender<FrameStats<f32>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Create a delay in case the input and output devices aren't synced.
         let channels = self.config.channels;
@@ -54,7 +53,7 @@ impl<'a> DumbLooper<'a> {
         for _ in 0..latency_samples {
             // The ring buffer has twice as much space as necessary to add latency here,
             // so this should never fail
-            producer.push(0.0).unwrap();
+            producer.push(cpal::Sample::from::<f32>(&0.0)).unwrap();
         }
 
         let mut previnp_callback: Option<cpal::StreamInstant> = None;
@@ -85,6 +84,9 @@ impl<'a> DumbLooper<'a> {
             previnp_capture = Some(inpinf.timestamp().capture);
             // TODO: don't reset fs every period.
             let mut fs = FrameStats::new(channels);
+            // for frame in data.chunks_exact_mut(self.config.channels.into()) {
+            //     fs.consume_frame(&mut frame.iter());
+            // }
             let mut iter = data.iter();
             while fs.consume_frame(&mut iter) {}
             fs_sender.send(fs).unwrap();
@@ -119,7 +121,7 @@ impl<'a> DumbLooper<'a> {
                     Some(s) => s,
                     None => {
                         input_fell_behind = true;
-                        0.0
+                        cpal::Sample::from::<f32>(&0.0)
                     }
                 };
             }
@@ -134,6 +136,10 @@ impl<'a> DumbLooper<'a> {
             self.config
         );
 
+        // These streams can live as long as &self, so the input_data_fn and
+        // output_data_fn closures, and thus the data they capture, need to
+        // also live that long. (Function parameters in input_data_fn and
+        // output_data_fn need live only as long as the function invocation.)
         use cpal::traits::DeviceTrait;
         self.input_stream = Some(self.input_device.build_input_stream(
             self.config,
@@ -161,53 +167,59 @@ impl<'a> DumbLooper<'a> {
 }
 
 const MAX_CHANNELS: usize = 2;
-const SAMPLE_SCALE_FACTOR: f32 = 100.0;
+const SAMPLE_SCALE_FACTOR: i16 = 256;
 #[derive(Clone, Debug)]
-pub struct FrameStats {
+pub struct FrameStats<T> {
     channels: cpal::ChannelCount,
-    max: [f32; MAX_CHANNELS as usize],
+    max: [T; MAX_CHANNELS as usize],
     max_cnt: [u32; MAX_CHANNELS as usize],
+    min: [T; MAX_CHANNELS as usize],
+    min_cnt: [u32; MAX_CHANNELS as usize],
     acc: [u32; MAX_CHANNELS as usize],
     cnt: [u32; MAX_CHANNELS as usize],
 }
-impl FrameStats {
-    pub fn new(channels: cpal::ChannelCount) -> FrameStats {
+
+impl<T: cpal::Sample> FrameStats<T> {
+    fn new(channels: cpal::ChannelCount) -> FrameStats<T> {
         FrameStats {
             channels: channels,
-            max: [0.0; MAX_CHANNELS],
+            // Review: is there a better way to implement "0 as T"?
+            max: [T::from::<i16>(&0); MAX_CHANNELS],
             max_cnt: [0; MAX_CHANNELS],
+            // Review: is there a better way to implement "0 as T"?
+            min: [T::from(&(0 as i16)); MAX_CHANNELS],
+            min_cnt: [0; MAX_CHANNELS],
             acc: [0; MAX_CHANNELS],
             cnt: [0; MAX_CHANNELS],
         }
     }
+}
 
-    /// Collects statistics from `feed`.
-    //
-    // Partially generic version of the function below:
-    //
-    // fn consume_frame<'a, I>(&mut self, feed: &mut I) -> bool
-    // where
-    //     I: Iterator<Item = &'a f32>,
-    // { ... }
-    //
-    // Parameterising out f32 might allow this to function with e.g. u16 or u32
-    // too. However it should be parameterised out at the FrameStats level.
-    pub fn consume_frame<'a>(&mut self, feed: &mut impl Iterator<Item = &'a f32>) -> bool {
+impl<'a, T: 'a + cpal::Sample + PartialEq + PartialOrd> FrameStats<T> {
+    fn consume_frame(&mut self, feed: &mut impl Iterator<Item = &'a T>) -> bool {
         for c in 0..self.channels as usize {
             match feed.next() {
                 Some(s) => {
                     if c > MAX_CHANNELS {
                         continue;
                     }
-                    // TODO: take abs, or check min?
                     if *s > self.max[c] {
                         self.max[c] = *s;
                         self.max_cnt[c] = 1;
-                    } else if *s == self.max[c] {
-                        self.max_cnt[c] += 1;
+                    } else if *s < self.min[c] {
+                        self.min[c] = *s;
+                        self.min_cnt[c] = 1;
+                    } else {
+                        if *s == self.max[c] {
+                            self.max_cnt[c] += 1;
+                        }
+                        if *s == self.min[c] {
+                            self.min_cnt[c] += 1;
+                        }
                     }
-                    let s: u32 = (SAMPLE_SCALE_FACTOR * s) as u32;
-                    let ss = s * s;
+                    let s: i16 = cpal::Sample::from::<T>(s);
+                    let s = s / SAMPLE_SCALE_FACTOR;
+                    let ss = (s * s) as u32;
                     self.acc[c] += ss; // TODO: deal with overflow!
                     self.cnt[c] += 1;
                 }
@@ -216,24 +228,27 @@ impl FrameStats {
         }
         return true;
     }
+}
 
+// TODO: we need only number_traits::Sqrt;
+impl<T: cpal::Sample + std::fmt::Display> FrameStats<T> {
     pub fn format_stats(&self) -> String {
+        const BAR_SIZE: i32 = 40;
         let mut s = String::with_capacity(120);
         for c in 0..self.channels as usize {
             s.push_str(" | ");
-            let rms = (self.acc[c] as f32 / self.cnt[c] as f32).sqrt();
+            let rms = ((self.acc[c] as f32 / self.cnt[c] as f32).sqrt()
+                * SAMPLE_SCALE_FACTOR as f32) as i16;
+            let bar_len = rms as i32 * BAR_SIZE / ::std::i16::MAX as i32;
+            let rms: T = cpal::Sample::from(&rms);
             s.push_str(&format!(
-                "max: {:.3}, max_cnt: {:3}, rms: {:.3}, cnt: {} ",
-                self.max[c].sqrt(),
-                self.max_cnt[c],
-                rms,
-                self.cnt[c]
+                "min-max: {:.3}-{:.3}; cnts: {:3},{:3}; rms: {:.3}, cnt: {} ",
+                self.min[c], self.max[c], self.min_cnt[c], self.max_cnt[c], rms, self.cnt[c]
             ));
-            let bar_len = (50.0 * rms / SAMPLE_SCALE_FACTOR) as u32;
             for _ in 0..bar_len {
                 s.push('#');
             }
-            for _ in bar_len..50 {
+            for _ in bar_len..BAR_SIZE {
                 s.push(' ');
             }
         }
@@ -241,28 +256,28 @@ impl FrameStats {
     }
 }
 
-pub const CHUNK_SIZE: usize = 8192;
+const CHUNK_SIZE: usize = 8192;
 const MAX_CHUNKS: usize = 1024;
 const MAX_STATS: usize = 100;
-type Chunk = Arc<[f32; CHUNK_SIZE]>;
-pub fn new_chunk() -> Chunk {
-    Arc::new([0.0; CHUNK_SIZE])
+type Chunk<T> = Arc<[T; CHUNK_SIZE]>;
+fn new_chunk<T: cpal::Sample>() -> Chunk<T> {
+    Arc::new([T::from::<i16>(&0); CHUNK_SIZE])
 }
-pub struct Coordinator {
-    chunk_receiver: mpsc::Receiver<Chunk>,
-    request_receiver: mpsc::Receiver<Request>,
-    frame_stats_receiver: mpsc::Receiver<FrameStats>,
-    chunks: Vec<Chunk>,
+pub struct Coordinator<T: cpal::Sample + Send> {
+    chunk_receiver: mpsc::Receiver<Chunk<T>>,
+    request_receiver: mpsc::Receiver<Request<T>>,
+    frame_stats_receiver: mpsc::Receiver<FrameStats<T>>,
+    chunks: Vec<Chunk<T>>,
     chunks_pos: usize,
-    stats: Vec<FrameStats>,
+    stats: Vec<FrameStats<T>>,
     stats_pos: usize,
 }
-impl Coordinator {
+impl<T: cpal::Sample + Send> Coordinator<T> {
     pub fn new(
-        chunk_receiver: mpsc::Receiver<Chunk>,
-        request_receiver: mpsc::Receiver<Request>,
-        frame_stats_receiver: mpsc::Receiver<FrameStats>,
-    ) -> Coordinator {
+        chunk_receiver: mpsc::Receiver<Chunk<T>>,
+        request_receiver: mpsc::Receiver<Request<T>>,
+        frame_stats_receiver: mpsc::Receiver<FrameStats<T>>,
+    ) -> Coordinator<T> {
         Coordinator {
             chunk_receiver: chunk_receiver,
             request_receiver: request_receiver,

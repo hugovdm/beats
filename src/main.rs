@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Review: why can we pass a SyncSender to Rocket's .manage() but not a Sender?
     // let (req_sender, req_receiver) = mpsc::channel();
     let (req_sender, req_receiver) = mpsc::sync_channel(100);
-    let mut coordinator =
+    let mut coordinator: audioplumbing::Coordinator<f32> =
         audioplumbing::Coordinator::new(chunk_receiver, req_receiver, fs_receiver);
     thread::spawn(move || coordinator.run());
 
