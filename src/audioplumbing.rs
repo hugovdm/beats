@@ -83,6 +83,7 @@ impl<'a> DumbLooper<'a> {
             }
             previnp_callback = Some(inpinf.timestamp().callback);
             previnp_capture = Some(inpinf.timestamp().capture);
+            // TODO: don't reset fs every period.
             let mut fs = FrameStats::new(channels);
             let mut iter = data.iter();
             while fs.consume_frame(&mut iter) {}
@@ -160,12 +161,13 @@ impl<'a> DumbLooper<'a> {
 }
 
 const MAX_CHANNELS: usize = 2;
+const SAMPLE_SCALE_FACTOR: f32 = 100.0;
 #[derive(Clone, Debug)]
 pub struct FrameStats {
     channels: cpal::ChannelCount,
     max: [f32; MAX_CHANNELS as usize],
     max_cnt: [u32; MAX_CHANNELS as usize],
-    acc: [f32; MAX_CHANNELS as usize],
+    acc: [u32; MAX_CHANNELS as usize],
     cnt: [u32; MAX_CHANNELS as usize],
 }
 impl FrameStats {
@@ -174,7 +176,7 @@ impl FrameStats {
             channels: channels,
             max: [0.0; MAX_CHANNELS],
             max_cnt: [0; MAX_CHANNELS],
-            acc: [0.0; MAX_CHANNELS],
+            acc: [0; MAX_CHANNELS],
             cnt: [0; MAX_CHANNELS],
         }
     }
@@ -197,15 +199,17 @@ impl FrameStats {
                     if c > MAX_CHANNELS {
                         continue;
                     }
-                    let ss = s * s;
-                    self.acc[c] += ss;
-                    self.cnt[c] += 1;
-                    if ss > self.max[c] {
-                        self.max[c] = ss;
+                    // TODO: take abs, or check min?
+                    if *s > self.max[c] {
+                        self.max[c] = *s;
                         self.max_cnt[c] = 1;
-                    } else if ss == self.max[c] {
+                    } else if *s == self.max[c] {
                         self.max_cnt[c] += 1;
                     }
+                    let s: u32 = (SAMPLE_SCALE_FACTOR * s) as u32;
+                    let ss = s * s;
+                    self.acc[c] += ss; // TODO: deal with overflow!
+                    self.cnt[c] += 1;
                 }
                 None => return false,
             }
@@ -217,7 +221,7 @@ impl FrameStats {
         let mut s = String::with_capacity(120);
         for c in 0..self.channels as usize {
             s.push_str(" | ");
-            let rms = (self.acc[c] / self.cnt[c] as f32).sqrt();
+            let rms = (self.acc[c] as f32 / self.cnt[c] as f32).sqrt();
             s.push_str(&format!(
                 "max: {:.3}, max_cnt: {:3}, rms: {:.3}, cnt: {} ",
                 self.max[c].sqrt(),
@@ -225,7 +229,7 @@ impl FrameStats {
                 rms,
                 self.cnt[c]
             ));
-            let bar_len = (50.0 * rms) as u32;
+            let bar_len = (50.0 * rms / SAMPLE_SCALE_FACTOR) as u32;
             for _ in 0..bar_len {
                 s.push('#');
             }
