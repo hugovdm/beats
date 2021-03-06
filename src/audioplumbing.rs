@@ -1,15 +1,57 @@
 use std::sync::mpsc;
 use std::sync::Arc;
 
-pub enum Request<T> {
+pub trait Sample: cpal::Sample + PartialEq + PartialOrd + Send + std::fmt::Display {}
+
+impl Sample for f32 {}
+
+pub enum CoordinatorRequest<T: Sample> {
     StatsRequest { resp: mpsc::Sender<FrameStats<T>> },
+}
+
+#[derive(Debug)]
+pub enum ControllerError<T: Sample> {
+    SendError {
+        e: mpsc::SendError<CoordinatorRequest<T>>,
+    },
+    RecvError {
+        e: mpsc::RecvError,
+    },
+}
+
+pub type ControllerResult<T, U> = Result<T, ControllerError<U>>;
+
+#[derive(Clone)]
+pub struct Controller<T: Sample> {
+    req_sender: mpsc::SyncSender<CoordinatorRequest<T>>,
+}
+
+/// Controls the Coordinator
+impl<T: Sample> Controller<T> {
+    pub fn new(req_sender: mpsc::SyncSender<CoordinatorRequest<T>>) -> Self {
+        Self { req_sender }
+    }
+
+    pub fn get_frame_stats(&self) -> ControllerResult<FrameStats<T>, T> {
+        let (resp_sender, resp_receiver) = mpsc::channel();
+        let req = CoordinatorRequest::StatsRequest {
+            resp: resp_sender.clone(),
+        };
+        match self.req_sender.send(req) {
+            Err(why) => Err(ControllerError::SendError { e: why }),
+            Ok(()) => match resp_receiver.recv() {
+                Err(why) => Err(ControllerError::RecvError { e: why }),
+                Ok(result) => Ok(result),
+            },
+        }
+    }
 }
 
 fn err_fn(err: cpal::StreamError) {
     eprintln!("an error occurred on stream: {}", err);
 }
 
-pub struct DumbLooper<'a> {
+pub struct AudioPlumbing<'a> {
     // Change to i32? 1ms is already only 48 samples?
     input_device: &'a cpal::Device,
     output_device: &'a cpal::Device,
@@ -18,14 +60,15 @@ pub struct DumbLooper<'a> {
     input_stream: Option<cpal::Stream>,
     output_stream: Option<cpal::Stream>,
 }
-impl<'a> DumbLooper<'a> {
+
+impl<'a> AudioPlumbing<'a> {
     pub fn new(
         input_device: &'a cpal::Device,
         output_device: &'a cpal::Device,
         config: &'a cpal::StreamConfig,
         delay_ms: f32,
     ) -> Self {
-        Self {
+        AudioPlumbing {
             input_device,
             output_device,
             config,
@@ -34,6 +77,7 @@ impl<'a> DumbLooper<'a> {
             output_stream: None,
         }
     }
+
     pub fn play(
         &mut self,
         chunk_sender: mpsc::Sender<Chunk<f32>>,
@@ -241,7 +285,7 @@ impl CpalDiagnostics {
 const MAX_CHANNELS: usize = 2;
 const SAMPLE_SCALE_FACTOR: i16 = 256;
 #[derive(Clone, Debug)]
-pub struct FrameStats<T> {
+pub struct FrameStats<T: Sample> {
     channels: cpal::ChannelCount,
     max: [T; MAX_CHANNELS as usize],
     max_cnt: [u32; MAX_CHANNELS as usize],
@@ -251,7 +295,7 @@ pub struct FrameStats<T> {
     cnt: [u32; MAX_CHANNELS as usize],
 }
 
-impl<T: cpal::Sample> FrameStats<T> {
+impl<T: Sample> FrameStats<T> {
     fn new(channels: cpal::ChannelCount) -> FrameStats<T> {
         FrameStats {
             channels: channels,
@@ -267,7 +311,7 @@ impl<T: cpal::Sample> FrameStats<T> {
     }
 }
 
-impl<'a, T: 'a + cpal::Sample + PartialEq + PartialOrd> FrameStats<T> {
+impl<'a, T: 'a + Sample> FrameStats<T> {
     fn consume_frame(&mut self, feed: &mut impl Iterator<Item = &'a T>) -> bool {
         for c in 0..self.channels as usize {
             match feed.next() {
@@ -303,7 +347,7 @@ impl<'a, T: 'a + cpal::Sample + PartialEq + PartialOrd> FrameStats<T> {
 }
 
 // TODO: we need only number_traits::Sqrt;
-impl<T: cpal::Sample + std::fmt::Display> FrameStats<T> {
+impl<T: Sample> FrameStats<T> {
     pub fn format_stats(&self) -> String {
         const BAR_SIZE: i32 = 40;
         let mut s = String::with_capacity(120);
@@ -332,22 +376,22 @@ const CHUNK_SIZE: usize = 8192;
 const MAX_CHUNKS: usize = 1024;
 const MAX_STATS: usize = 100;
 type Chunk<T> = Arc<[T; CHUNK_SIZE]>;
-fn new_chunk<T: cpal::Sample>() -> Chunk<T> {
+fn new_chunk<T: Sample>() -> Chunk<T> {
     Arc::new([T::from::<i16>(&0); CHUNK_SIZE])
 }
-pub struct Coordinator<T: cpal::Sample + Send> {
+pub struct Coordinator<T: Sample> {
     chunk_receiver: mpsc::Receiver<Chunk<T>>,
-    request_receiver: mpsc::Receiver<Request<T>>,
+    request_receiver: mpsc::Receiver<CoordinatorRequest<T>>,
     frame_stats_receiver: mpsc::Receiver<FrameStats<T>>,
     chunks: Vec<Chunk<T>>,
     chunks_pos: usize,
     stats: Vec<FrameStats<T>>,
     stats_pos: usize,
 }
-impl<T: cpal::Sample + Send> Coordinator<T> {
+impl<T: Sample> Coordinator<T> {
     pub fn new(
         chunk_receiver: mpsc::Receiver<Chunk<T>>,
-        request_receiver: mpsc::Receiver<Request<T>>,
+        request_receiver: mpsc::Receiver<CoordinatorRequest<T>>,
         frame_stats_receiver: mpsc::Receiver<FrameStats<T>>,
     ) -> Coordinator<T> {
         Coordinator {
@@ -383,7 +427,7 @@ impl<T: cpal::Sample + Send> Coordinator<T> {
             }
             while let Ok(req) = self.request_receiver.try_recv() {
                 match req {
-                    Request::StatsRequest { resp } => {
+                    CoordinatorRequest::StatsRequest { resp } => {
                         resp.send(self.stats[self.stats_pos - 1].clone()).unwrap()
                     }
                 }

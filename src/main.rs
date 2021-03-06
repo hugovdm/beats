@@ -82,26 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audioplumbing::Coordinator::new(chunk_receiver, req_receiver, fs_receiver);
     thread::spawn(move || coordinator.run());
 
-    use std::time::Duration;
-    let console_req_sender = req_sender.clone();
-    thread::spawn(move || {
-        let (resp_sender, resp_receiver) = mpsc::channel();
-        console_req_sender
-            .send(audioplumbing::Request::StatsRequest {
-                resp: resp_sender.clone(),
-            })
-            .unwrap();
-        while let Ok(fs) = resp_receiver.recv() {
-            println!("f{}", fs.format_stats());
-            thread::sleep(Duration::from_millis(100));
-            console_req_sender
-                .send(audioplumbing::Request::StatsRequest {
-                    resp: resp_sender.clone(),
-                })
-                .unwrap();
-        }
-    });
-
+    let controller = audioplumbing::Controller::<f32>::new(req_sender.clone());
     let r = rocket::ignite()
         .mount(
             "/",
@@ -112,11 +93,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 webui::dart_files
             ],
         )
+        .manage(controller.clone())
         .manage(req_sender);
 
-    let mut looper =
-        audioplumbing::DumbLooper::new(&input_device, &output_device, &config, latency_ms);
-    looper.play(chunk_sender.clone(), fs_sender.clone())?;
+    use std::time::Duration;
+    thread::spawn(move || {
+        while let Ok(fs) = controller.get_frame_stats() {
+            println!("{}", fs.format_stats());
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let mut plumbing =
+        audioplumbing::AudioPlumbing::new(&input_device, &output_device, &config, latency_ms);
+    plumbing.play(chunk_sender.clone(), fs_sender.clone())?;
 
     r.launch();
 

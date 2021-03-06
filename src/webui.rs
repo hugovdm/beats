@@ -4,7 +4,6 @@ use rocket::{
     State,
 };
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, SyncSender};
 
 #[get("/")]
 pub fn index() -> content::Html<String> {
@@ -18,16 +17,10 @@ pub fn index() -> content::Html<String> {
 }
 
 #[get("/stats")]
-pub fn stats(state: State<SyncSender<audioplumbing::Request<f32>>>) -> String {
-    let (resp_sender, resp_receiver) = channel();
-    state
-        .send(audioplumbing::Request::StatsRequest {
-            resp: resp_sender.clone(),
-        })
-        .unwrap();
-    match resp_receiver.recv() {
+pub fn stats(controller: State<audioplumbing::Controller<f32>>) -> String {
+    match controller.get_frame_stats() {
         Ok(fs) => fs.format_stats(),
-        Err(why) => format!("error receiving stats: {:?}", why),
+        Err(why) => format!("error getting frame stats: {:?}", why),
     }
 }
 
