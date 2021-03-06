@@ -56,8 +56,9 @@ impl<'a> DumbLooper<'a> {
             producer.push(cpal::Sample::from::<f32>(&0.0)).unwrap();
         }
 
-        let mut previnp_callback: Option<cpal::StreamInstant> = None;
-        let mut previnp_capture: Option<cpal::StreamInstant> = None;
+        let mut inp_diagnostics = CpalDiagnostics::empty("input");
+        let mut out_diagnostics = CpalDiagnostics::empty("output");
+
         // TODO: use new_uninit() for efficiency, bundling count and chunk into a
         // struct.
         let mut chunk = new_chunk();
@@ -65,49 +66,39 @@ impl<'a> DumbLooper<'a> {
         let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
             // TODO: move to stats that are available on-demand:
             // println!("input count {}    info: {:?}", data.len(), inpinf);
-            if previnp_callback != None && previnp_capture != None {
-                // println!(
-                //     "input timestamp diffs callback: {:?}, capture: {:?}",
-                //     inpinf
-                //         .timestamp()
-                //         .callback
-                //         .duration_since(&previnp_callback.unwrap())
-                //         .unwrap(),
-                //     inpinf
-                //         .timestamp()
-                //         .capture
-                //         .duration_since(&previnp_capture.unwrap())
-                //         .unwrap(),
-                // );
-            }
-            previnp_callback = Some(inpinf.timestamp().callback);
-            previnp_capture = Some(inpinf.timestamp().capture);
+            inp_diagnostics
+                .diagnose_capture(inpinf.timestamp().callback, inpinf.timestamp().capture);
             // TODO: don't reset fs every period.
             let mut fs = FrameStats::new(channels);
-            // for frame in data.chunks_exact_mut(self.config.channels.into()) {
-            //     fs.consume_frame(&mut frame.iter());
-            // }
-            let mut iter = data.iter();
-            while fs.consume_frame(&mut iter) {}
-            fs_sender.send(fs).unwrap();
-
             let mut output_fell_behind = false;
-            for &sample in data {
-                if producer.push(sample).is_err() {
-                    output_fell_behind = true;
+            assert_eq!(data.len() % channels as usize, 0);
+            for frame in data.chunks_exact(channels.into()) {
+                {
+                    fs.consume_frame(&mut frame.iter());
                 }
-                if sample_count >= CHUNK_SIZE {
-                    chunk_sender.send(chunk.clone()).unwrap();
-                    chunk = new_chunk();
-                    sample_count = 0;
+                for &sample in frame {
+                    if producer.push(sample).is_err() {
+                        // TODO: check that this only happens on frame boundaries
+                        output_fell_behind = true;
+                    }
+
+                    if sample_count >= CHUNK_SIZE {
+                        chunk_sender.send(chunk.clone()).unwrap();
+                        chunk = new_chunk();
+                        sample_count = 0;
+                    }
+
+                    // Review: is get_mut(...).unwrap() cheap? Can we somehow
+                    // move such binding to outside the for-loop, then somehow
+                    // unbind when we want to send(chunk.clone())? drop()?
+                    let c = Arc::get_mut(&mut chunk).unwrap();
+                    c[sample_count] = sample;
+                    sample_count = sample_count + 1;
                 }
-                // Review: is get_mut(...).unwrap() cheap? Can we somehow move
-                // such binding to outside the for-loop, then somehow unbind
-                // when we want to send(chunk.clone())?
-                let c = Arc::get_mut(&mut chunk).unwrap();
-                c[sample_count] = sample;
-                sample_count = sample_count + 1;
             }
+            // Sending fs: this is a move. We can't use it again. Different
+            // lifetime conditions than chunk.
+            fs_sender.send(fs).unwrap();
             if output_fell_behind {
                 eprintln!("output stream fell behind: try increasing latency");
             }
@@ -116,14 +107,19 @@ impl<'a> DumbLooper<'a> {
         let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
             // println!("output count {} info {:?}", data.len(), outinf);
             let mut input_fell_behind = false;
-            for sample in data {
-                *sample = match consumer.pop() {
-                    Some(s) => s,
-                    None => {
-                        input_fell_behind = true;
-                        cpal::Sample::from::<f32>(&0.0)
-                    }
-                };
+            out_diagnostics
+                .diagnose_playback(outinf.timestamp().callback, outinf.timestamp().playback);
+            assert_eq!(data.len() % channels as usize, 0);
+            for frame in data.chunks_exact_mut(channels.into()) {
+                for sample in frame {
+                    *sample = match consumer.pop() {
+                        Some(s) => s,
+                        None => {
+                            input_fell_behind = true;
+                            cpal::Sample::from::<f32>(&0.0)
+                        }
+                    };
+                }
             }
             if input_fell_behind {
                 eprintln!("input stream fell behind: try increasing latency");
@@ -163,6 +159,82 @@ impl<'a> DumbLooper<'a> {
         self.output_stream.as_ref().unwrap().play()?;
 
         Ok(())
+    }
+}
+
+struct CpalDiagnostics {
+    ident: &'static str,
+    callback: Option<cpal::StreamInstant>,
+    capture: Option<cpal::StreamInstant>,
+    playback: Option<cpal::StreamInstant>,
+    first: Option<cpal::StreamInstant>,
+}
+
+impl CpalDiagnostics {
+    fn empty(ident: &'static str) -> Self {
+        Self {
+            ident,
+            callback: None,
+            capture: None,
+            playback: None,
+            first: None,
+        }
+    }
+
+    fn diagnose_capture(&mut self, callback: cpal::StreamInstant, capture: cpal::StreamInstant) {
+        if self.first == None {
+            if callback.duration_since(&capture).is_some() {
+                self.first = Some(capture);
+            } else {
+                assert_eq!(capture.duration_since(&callback).is_some(), true);
+                self.first = Some(callback);
+            }
+        }
+        print!(
+            "{} timestamps: callback: {:?}, capture: {:?}",
+            self.ident,
+            callback.duration_since(&self.first.unwrap()).unwrap(),
+            capture.duration_since(&self.first.unwrap()).unwrap(),
+        );
+        if self.callback != None && self.capture != None {
+            println!(
+                " - diffs callback: {:?}, capture: {:?}",
+                callback.duration_since(&self.callback.unwrap()).unwrap(),
+                capture.duration_since(&self.capture.unwrap()).unwrap(),
+            );
+        } else {
+            println!();
+        }
+        self.callback = Some(callback);
+        self.capture = Some(capture);
+    }
+
+    fn diagnose_playback(&mut self, callback: cpal::StreamInstant, playback: cpal::StreamInstant) {
+        if self.first == None {
+            if callback.duration_since(&playback).is_some() {
+                self.first = Some(playback);
+            } else {
+                assert_eq!(playback.duration_since(&callback).is_some(), true);
+                self.first = Some(callback);
+            }
+        }
+        print!(
+            "{} timestamps: callback: {:?}, playback: {:?}",
+            self.ident,
+            callback.duration_since(&self.first.unwrap()).unwrap(),
+            playback.duration_since(&self.first.unwrap()).unwrap(),
+        );
+        if self.callback != None && self.playback != None {
+            println!(
+                " - diffs callback: {:?}, playback: {:?}",
+                callback.duration_since(&self.callback.unwrap()).unwrap(),
+                playback.duration_since(&self.playback.unwrap()).unwrap(),
+            );
+        } else {
+            println!();
+        }
+        self.callback = Some(callback);
+        self.playback = Some(playback);
     }
 }
 

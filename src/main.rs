@@ -82,10 +82,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audioplumbing::Coordinator::new(chunk_receiver, req_receiver, fs_receiver);
     thread::spawn(move || coordinator.run());
 
-    let mut looper =
-        audioplumbing::DumbLooper::new(&input_device, &output_device, &config, latency_ms);
-    looper.play(chunk_sender.clone(), fs_sender.clone())?;
-
     use std::time::Duration;
     let console_req_sender = req_sender.clone();
     thread::spawn(move || {
@@ -106,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    rocket::ignite()
+    let r = rocket::ignite()
         .mount(
             "/",
             routes![
@@ -116,8 +112,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 webui::dart_files
             ],
         )
-        .manage(req_sender)
-        .launch();
+        .manage(req_sender);
+
+    let mut looper =
+        audioplumbing::DumbLooper::new(&input_device, &output_device, &config, latency_ms);
+    looper.play(chunk_sender.clone(), fs_sender.clone())?;
+
+    r.launch();
 
     Ok(())
 }
