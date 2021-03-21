@@ -5,10 +5,12 @@ pub trait Sample: cpal::Sample + PartialEq + PartialOrd + Send + std::fmt::Displ
 
 impl Sample for f32 {}
 
+/// Requests for the Coordinator.
 pub enum CoordinatorRequest<T: Sample> {
     StatsRequest { resp: mpsc::Sender<FrameStats<T>> },
 }
 
+/// Errors produced by the Controller.
 #[derive(Debug)]
 pub enum ControllerError<T: Sample> {
     SendError {
@@ -19,19 +21,22 @@ pub enum ControllerError<T: Sample> {
     },
 }
 
+/// Results produced by the Controller.
 pub type ControllerResult<T, U> = Result<T, ControllerError<U>>;
 
+/// Controls the Coordinator
 #[derive(Clone)]
 pub struct Controller<T: Sample> {
     req_sender: mpsc::SyncSender<CoordinatorRequest<T>>,
 }
 
-/// Controls the Coordinator
+/// FIXME: does this show up somewhere in rustdoc?
 impl<T: Sample> Controller<T> {
     pub fn new(req_sender: mpsc::SyncSender<CoordinatorRequest<T>>) -> Self {
         Self { req_sender }
     }
 
+    /// Makes a StatsRequest for the Coordinator.
     pub fn get_frame_stats(&self) -> ControllerResult<FrameStats<T>, T> {
         let (resp_sender, resp_receiver) = mpsc::channel();
         let req = CoordinatorRequest::StatsRequest {
@@ -48,9 +53,14 @@ impl<T: Sample> Controller<T> {
 }
 
 fn err_fn(err: cpal::StreamError) {
-    eprintln!("an error occurred on stream: {}", err);
+    eprintln!(
+        "thread {}: an error occurred on stream: {}",
+        thread_id::get(),
+        err
+    );
 }
 
+/// Owns CPAL-related instances and data.
 pub struct AudioPlumbing<'a> {
     // Change to i32? 1ms is already only 48 samples?
     input_device: &'a cpal::Device,
@@ -61,6 +71,7 @@ pub struct AudioPlumbing<'a> {
     output_stream: Option<cpal::Stream>,
 }
 
+use thread_id;
 impl<'a> AudioPlumbing<'a> {
     pub fn new(
         input_device: &'a cpal::Device,
@@ -78,6 +89,7 @@ impl<'a> AudioPlumbing<'a> {
         }
     }
 
+    // Creates closures that run in cpal-managed threads.
     pub fn play(
         &mut self,
         chunk_sender: mpsc::Sender<Chunk<f32>>,
@@ -144,19 +156,44 @@ impl<'a> AudioPlumbing<'a> {
             // lifetime conditions than chunk.
             fs_sender.send(fs).unwrap();
             if output_fell_behind {
-                eprintln!("output stream fell behind: try increasing latency");
+                eprintln!(
+                    "thread {}: output stream fell behind: try increasing latency",
+                    thread_id::get()
+                );
             }
         };
 
         let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
-            // println!("output count {} info {:?}", data.len(), outinf);
+            // Performane thoughts: we don't want to call a bunch of functions
+            // for every sample: function call overhead. We also don't want to
+            // invalidate the fastest cache for every function call. Thus the
+            // number of frames we want to process with each function call
+            // probably depends on the L1 cache size on the processor we're
+            // running on. Find good ways to benchmark and select "number of
+            // frames per function call"?
+
+            println!(
+                "thread {}: output count {} info {:?}",
+                thread_id::get(),
+                data.len(),
+                outinf
+            );
             let mut input_fell_behind = false;
             out_diagnostics
                 .diagnose_playback(outinf.timestamp().callback, outinf.timestamp().playback);
             assert_eq!(data.len() % channels as usize, 0);
+            // First we initialize the buffer, such that other function calls
+            // have initialized values. (The buffer doesn't start out empty -
+            // presumably past output values? Experiment with not initializing,
+            // out of curiosity!)
             for frame in data.chunks_exact_mut(channels.into()) {
                 for sample in frame {
-                    *sample = match consumer.pop() {
+                    *sample = cpal::Sample::from::<f32>(&0.0)
+                }
+            }
+            for frame in data.chunks_exact_mut(channels.into()) {
+                for sample in frame {
+                    *sample += match consumer.pop() {
                         Some(s) => s,
                         None => {
                             input_fell_behind = true;
@@ -166,13 +203,17 @@ impl<'a> AudioPlumbing<'a> {
                 }
             }
             if input_fell_behind {
-                eprintln!("input stream fell behind: try increasing latency");
+                eprintln!(
+                    "thread {}: input stream fell behind: try increasing latency",
+                    thread_id::get()
+                );
             }
         };
 
         // Build streams.
         println!(
-            "Attempting to build both streams with f32 samples and `{:?}`.",
+            "thread {}: Attempting to build both streams with f32 samples and `{:?}`.",
+            thread_id::get(),
             self.config
         );
 
@@ -191,11 +232,12 @@ impl<'a> AudioPlumbing<'a> {
             output_data_fn,
             err_fn,
         )?);
-        println!("Successfully built streams.");
+        println!("thread {}: Successfully built streams.", thread_id::get());
 
         // Play the streams.
         println!(
-            "Starting the input and output streams with `{}` milliseconds of latency.",
+            "thread {}: Starting the input and output streams with `{}` milliseconds of latency.",
+            thread_id::get(),
             self.delay_ms,
         );
         use cpal::traits::StreamTrait;
@@ -235,7 +277,8 @@ impl CpalDiagnostics {
             }
         }
         print!(
-            "{} timestamps: callback: {:?}, capture: {:?}",
+            "thread {}: {} timestamps: callback: {:?}, capture: {:?}",
+            thread_id::get(),
             self.ident,
             callback.duration_since(&self.first.unwrap()).unwrap(),
             capture.duration_since(&self.first.unwrap()).unwrap(),
@@ -263,7 +306,8 @@ impl CpalDiagnostics {
             }
         }
         print!(
-            "{} timestamps: callback: {:?}, playback: {:?}",
+            "thread {}: {} timestamps: callback: {:?}, playback: {:?}",
+            thread_id::get(),
             self.ident,
             callback.duration_since(&self.first.unwrap()).unwrap(),
             playback.duration_since(&self.first.unwrap()).unwrap(),
