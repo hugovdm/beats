@@ -1,7 +1,11 @@
+use std::ops::AddAssign;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-pub trait Sample: cpal::Sample + PartialEq + PartialOrd + Send + std::fmt::Display {}
+pub trait Sample:
+    cpal::Sample + PartialEq + PartialOrd + AddAssign + Send + std::fmt::Display + std::fmt::Debug
+{
+}
 
 impl Sample for f32 {}
 
@@ -52,6 +56,110 @@ impl<T: Sample> Controller<T> {
     }
 }
 
+use ringbuf::RingBuffer;
+
+struct SimpleLooper<T: Sample> {
+    channels: u16,
+    producer: ringbuf::Producer<T>,
+    consumer: ringbuf::Consumer<T>,
+}
+
+impl<'b, T: Sample + 'b> SimpleLooper<T> {
+    fn new(delay_ms: f32, config: &cpal::StreamConfig) -> Self {
+        let latency_frames = (delay_ms / 1_000.0) * config.sample_rate.0 as f32;
+        let latency_samples = latency_frames as usize * config.channels as usize;
+
+        // The buffer to share samples
+        let ring = RingBuffer::<T>::new(latency_samples * 2);
+        let (mut producer, consumer) = ring.split();
+
+        // Fill the samples with 0.0 equal to the length of the delay.
+        for _ in 0..latency_samples {
+            // The ring buffer has twice as much space as necessary to add latency here,
+            // so this should never fail
+            producer.push(cpal::Sample::from::<f32>(&0.0)).unwrap();
+        }
+
+        SimpleLooper {
+            channels: config.channels,
+            producer,
+            consumer,
+        }
+    }
+
+    fn get_data_callbacks(
+        self,
+    ) -> (
+        impl FnMut(&[T], &cpal::InputCallbackInfo) + 'b,
+        impl FnMut(&mut [T], &cpal::OutputCallbackInfo) + 'b,
+    ) {
+        let channels = self.channels;
+        let mut producer = self.producer;
+        let mut consumer = self.consumer;
+
+        let inp_fn = move |data: &[T], _: &cpal::InputCallbackInfo| {
+            SimpleLooper::<T>::input_fn(channels, &mut producer, data)
+        };
+
+        let outp_fn = move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            SimpleLooper::<T>::output_fn(channels, &mut consumer, data)
+        };
+
+        (inp_fn, outp_fn)
+    }
+
+    /// Processes input data
+    ///
+    /// For efficiency purposes, accepts a whole slice of data rather than only
+    /// one frame at a time. TODO: performance testing a version of this which
+    /// calls input_fn for each frame?
+    fn input_fn(channels: u16, producer: &'b mut ringbuf::Producer<T>, data: &[T]) {
+        assert_eq!(data.len() % channels as usize, 0);
+        let mut output_fell_behind = false;
+        // TODO: chunking not necessary. Check benchmark results?
+        for frame in data.chunks_exact(channels.into()) {
+            for &sample in frame {
+                if producer.push(sample).is_err() {
+                    // TODO: check that this only happens on frame boundaries
+                    output_fell_behind = true;
+                }
+            }
+        }
+        if output_fell_behind {
+            eprintln!(
+                "thread {}: SimpleLooper output stream fell behind: try increasing latency",
+                thread_id::get()
+            );
+        }
+    }
+
+    fn output_fn(channels: u16, consumer: &'b mut ringbuf::Consumer<T>, data: &mut [T]) {
+        assert_eq!(data.len() % channels as usize, 0);
+        let mut input_fell_behind = false;
+        // TODO: chunking not necessary. Check benchmark results?
+        for frame in data.chunks_exact_mut(channels.into()) {
+            for sample in frame {
+                *sample += match consumer.pop() {
+                    Some(s) => s,
+                    None => {
+                        // TODO: check that this only happens on frame
+                        // boundaries?
+                        input_fell_behind = true;
+                        cpal::Sample::from::<f32>(&0.0)
+                    }
+                };
+            }
+        }
+        if input_fell_behind {
+            eprintln!(
+                "thread {}: SimpleLooper input stream fell behind: try increasing latency",
+                thread_id::get()
+            );
+        }
+    }
+}
+
+/// Handles CPAL stream errrors.
 fn err_fn(err: cpal::StreamError) {
     eprintln!(
         "thread {}: an error occurred on stream: {}",
@@ -95,25 +203,13 @@ impl<'a> AudioPlumbing<'a> {
         chunk_sender: mpsc::Sender<Chunk<f32>>,
         fs_sender: mpsc::Sender<FrameStats<f32>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Create a delay in case the input and output devices aren't synced.
         let channels = self.config.channels;
-        let latency_frames = (self.delay_ms / 1_000.0) * self.config.sample_rate.0 as f32;
-        let latency_samples = latency_frames as usize * channels as usize;
-
-        // The buffer to share samples
-        use ringbuf::RingBuffer;
-        let ring = RingBuffer::new(latency_samples * 2);
-        let (mut producer, mut consumer) = ring.split();
-
-        // Fill the samples with 0.0 equal to the length of the delay.
-        for _ in 0..latency_samples {
-            // The ring buffer has twice as much space as necessary to add latency here,
-            // so this should never fail
-            producer.push(cpal::Sample::from::<f32>(&0.0)).unwrap();
-        }
 
         let mut inp_diagnostics = CpalDiagnostics::empty("input");
         let mut out_diagnostics = CpalDiagnostics::empty("output");
+
+        let looper1 = SimpleLooper::<f32>::new(self.delay_ms, self.config);
+        let (mut looper1_input_fn, mut looper1_output_fn) = looper1.get_data_callbacks();
 
         // TODO: use new_uninit() for efficiency, bundling count and chunk into a
         // struct.
@@ -126,18 +222,10 @@ impl<'a> AudioPlumbing<'a> {
                 .diagnose_capture(inpinf.timestamp().callback, inpinf.timestamp().capture);
             // TODO: don't reset fs every period.
             let mut fs = FrameStats::new(channels);
-            let mut output_fell_behind = false;
             assert_eq!(data.len() % channels as usize, 0);
             for frame in data.chunks_exact(channels.into()) {
-                {
-                    fs.consume_frame(&mut frame.iter());
-                }
+                fs.consume_frame(&mut frame.iter());
                 for &sample in frame {
-                    if producer.push(sample).is_err() {
-                        // TODO: check that this only happens on frame boundaries
-                        output_fell_behind = true;
-                    }
-
                     if sample_count >= CHUNK_SIZE {
                         chunk_sender.send(chunk.clone()).unwrap();
                         chunk = new_chunk();
@@ -155,12 +243,8 @@ impl<'a> AudioPlumbing<'a> {
             // Sending fs: this is a move. We can't use it again. Different
             // lifetime conditions than chunk.
             fs_sender.send(fs).unwrap();
-            if output_fell_behind {
-                eprintln!(
-                    "thread {}: output stream fell behind: try increasing latency",
-                    thread_id::get()
-                );
-            }
+
+            looper1_input_fn(data, inpinf);
         };
 
         let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
@@ -178,7 +262,6 @@ impl<'a> AudioPlumbing<'a> {
                 data.len(),
                 outinf
             );
-            let mut input_fell_behind = false;
             out_diagnostics
                 .diagnose_playback(outinf.timestamp().callback, outinf.timestamp().playback);
             assert_eq!(data.len() % channels as usize, 0);
@@ -191,23 +274,7 @@ impl<'a> AudioPlumbing<'a> {
                     *sample = cpal::Sample::from::<f32>(&0.0)
                 }
             }
-            for frame in data.chunks_exact_mut(channels.into()) {
-                for sample in frame {
-                    *sample += match consumer.pop() {
-                        Some(s) => s,
-                        None => {
-                            input_fell_behind = true;
-                            cpal::Sample::from::<f32>(&0.0)
-                        }
-                    };
-                }
-            }
-            if input_fell_behind {
-                eprintln!(
-                    "thread {}: input stream fell behind: try increasing latency",
-                    thread_id::get()
-                );
-            }
+            looper1_output_fn(data, outinf);
         };
 
         // Build streams.
@@ -416,13 +483,22 @@ impl<T: Sample> FrameStats<T> {
     }
 }
 
+/// Total number of samples in a Chunk. This must be a multiple of the number of
+/// channels (number of samples in a frame).
 const CHUNK_SIZE: usize = 8192;
+/// Maximum number of chunks a Coordinator will keep track of. (More chunks will
+/// remain in memory as long as other references to them remain.)
 const MAX_CHUNKS: usize = 1024;
+/// Number of historical FrameStats a Coordinator holds onto.
 const MAX_STATS: usize = 100;
+/// A chunk of audio data who's lifetime is managed via reference counting.
 type Chunk<T> = Arc<[T; CHUNK_SIZE]>;
+/// Allocates and returns a new Chunk.
 fn new_chunk<T: Sample>() -> Chunk<T> {
     Arc::new([T::from::<i16>(&0); CHUNK_SIZE])
 }
+/// Coordinates the flow of audio and statistics through use of multiple
+/// channels.
 pub struct Coordinator<T: Sample> {
     chunk_receiver: mpsc::Receiver<Chunk<T>>,
     request_receiver: mpsc::Receiver<CoordinatorRequest<T>>,
