@@ -8,6 +8,8 @@ pub trait Sample:
 }
 
 impl Sample for f32 {}
+impl Sample for i16 {}
+impl Sample for u16 {}
 
 /// Requests for the Coordinator.
 pub enum CoordinatorRequest<T: Sample> {
@@ -59,7 +61,7 @@ impl<T: Sample> Controller<T> {
 use ringbuf::RingBuffer;
 
 struct SimpleLooper<T: Sample> {
-    channels: u16,
+    channels: cpal::ChannelCount,
     producer: ringbuf::Producer<T>,
     consumer: ringbuf::Consumer<T>,
 }
@@ -113,7 +115,7 @@ impl<'b, T: Sample + 'b> SimpleLooper<T> {
     /// For efficiency purposes, accepts a whole slice of data rather than only
     /// one frame at a time. TODO: performance testing a version of this which
     /// calls input_fn for each frame?
-    fn input_fn(channels: u16, producer: &'b mut ringbuf::Producer<T>, data: &[T]) {
+    fn input_fn(channels: cpal::ChannelCount, producer: &'b mut ringbuf::Producer<T>, data: &[T]) {
         assert_eq!(data.len() % channels as usize, 0);
         let mut output_fell_behind = false;
         // TODO: chunking not necessary. Check benchmark results?
@@ -133,7 +135,11 @@ impl<'b, T: Sample + 'b> SimpleLooper<T> {
         }
     }
 
-    fn output_fn(channels: u16, consumer: &'b mut ringbuf::Consumer<T>, data: &mut [T]) {
+    fn output_fn(
+        channels: cpal::ChannelCount,
+        consumer: &'b mut ringbuf::Consumer<T>,
+        data: &mut [T],
+    ) {
         assert_eq!(data.len() % channels as usize, 0);
         let mut input_fell_behind = false;
         // TODO: chunking not necessary. Check benchmark results?
@@ -197,7 +203,10 @@ impl<'a> AudioPlumbing<'a> {
         }
     }
 
-    // Creates closures that run in cpal-managed threads.
+    /// Creates closures that run in cpal-managed threads.
+    ///
+    /// Sends clones of the chunks via chunk_sender (perhaps to a Coordinator?).
+    /// Sends FrameStats via fs_sender.
     pub fn play(
         &mut self,
         chunk_sender: mpsc::Sender<Chunk<f32>>,
@@ -211,10 +220,12 @@ impl<'a> AudioPlumbing<'a> {
         let looper1 = SimpleLooper::<f32>::new(self.delay_ms, self.config);
         let (mut looper1_input_fn, mut looper1_output_fn) = looper1.get_data_callbacks();
 
-        // TODO: use new_uninit() for efficiency, bundling count and chunk into a
-        // struct.
-        let mut chunk = new_chunk();
+        let mut chunk = new_chunk(channels);
         let mut sample_count: usize = 0;
+        let mut env_idx: usize = 0;
+        // TODO: use new_unint() for efficiency:
+        let mut env_acc: [f32; MAX_CHANNELS] = [0.0; MAX_CHANNELS];
+        let mut env_count: usize = 0;
         let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
             // TODO: move to stats that are available on-demand:
             // println!("input count {}    info: {:?}", data.len(), inpinf);
@@ -225,19 +236,36 @@ impl<'a> AudioPlumbing<'a> {
             assert_eq!(data.len() % channels as usize, 0);
             for frame in data.chunks_exact(channels.into()) {
                 fs.consume_frame(&mut frame.iter());
-                for &sample in frame {
-                    if sample_count >= CHUNK_SIZE {
-                        chunk_sender.send(chunk.clone()).unwrap();
-                        chunk = new_chunk();
-                        sample_count = 0;
-                    }
 
-                    // Review: is get_mut(...).unwrap() cheap? Can we somehow
-                    // move such binding to outside the for-loop, then somehow
-                    // unbind when we want to send(chunk.clone())? drop()?
-                    let c = Arc::get_mut(&mut chunk).unwrap();
-                    c[sample_count] = sample;
-                    sample_count = sample_count + 1;
+                // Review: is get_mut(...).unwrap() cheap? Can we somehow
+                // move such binding to outside the for-loop, then somehow
+                // unbind when we want to send(chunk.clone())? drop()?
+                let c = Arc::get_mut(&mut chunk).unwrap();
+
+                let mut chan = 0; // TODO: figure out enumerate() for (i, &sample)?
+                for &sample in frame {
+                    c.audio[sample_count] = sample;
+                    sample_count += 1;
+                    env_acc[chan] += sample;
+                    chan += 1;
+                }
+                env_count += 1;
+
+                if env_count == DOWNSAMPLE_WINDOW {
+                    for chan in 0..channels.into() {
+                        c.envelope[env_idx] = env_acc[chan] / DOWNSAMPLE_WINDOW as f32;
+                        env_idx += 1;
+                    }
+                    env_count = 0;
+                }
+
+                if sample_count >= CHUNK_SIZE {
+                    assert_eq!(env_count, 0);
+                    assert_eq!(env_idx, ENV_SIZE);
+                    chunk_sender.send(chunk.clone()).unwrap();
+                    chunk = new_chunk(channels);
+                    sample_count = 0;
+                    env_idx = 0;
                 }
             }
             // Sending fs: this is a move. We can't use it again. Different
@@ -398,18 +426,18 @@ const SAMPLE_SCALE_FACTOR: i16 = 256;
 #[derive(Clone, Debug)]
 pub struct FrameStats<T: Sample> {
     channels: cpal::ChannelCount,
-    max: [T; MAX_CHANNELS as usize],
-    max_cnt: [u32; MAX_CHANNELS as usize],
-    min: [T; MAX_CHANNELS as usize],
-    min_cnt: [u32; MAX_CHANNELS as usize],
-    acc: [u32; MAX_CHANNELS as usize],
-    cnt: [u32; MAX_CHANNELS as usize],
+    max: [T; MAX_CHANNELS],
+    max_cnt: [u32; MAX_CHANNELS],
+    min: [T; MAX_CHANNELS],
+    min_cnt: [u32; MAX_CHANNELS],
+    acc: [u32; MAX_CHANNELS],
+    cnt: [u32; MAX_CHANNELS],
 }
 
 impl<T: Sample> FrameStats<T> {
     fn new(channels: cpal::ChannelCount) -> FrameStats<T> {
         FrameStats {
-            channels: channels,
+            channels,
             // Review: is there a better way to implement "0 as T"?
             max: [T::from::<i16>(&0); MAX_CHANNELS],
             max_cnt: [0; MAX_CHANNELS],
@@ -483,22 +511,41 @@ impl<T: Sample> FrameStats<T> {
     }
 }
 
-/// Total number of samples in a Chunk. This must be a multiple of the number of
-/// channels (number of samples in a frame).
-const CHUNK_SIZE: usize = 8192;
+/// Number of samples to combine to produce comparatively low sampling rate
+/// envelope, and for other calculations where lower sampling rate makes sense
+/// for efficiency.
+const DOWNSAMPLE_WINDOW: usize = 360;
+/// Number of samples in the envelope in each Chunk.
+const ENV_SIZE: usize = 32;
+/// Total number of audio samples in a Chunk. This must be a multiple of the
+/// number of channels (number of samples in a frame).
+const CHUNK_SIZE: usize = DOWNSAMPLE_WINDOW * ENV_SIZE;
 /// Maximum number of chunks a Coordinator will keep track of. (More chunks will
 /// remain in memory as long as other references to them remain.)
 const MAX_CHUNKS: usize = 1024;
 /// Number of historical FrameStats a Coordinator holds onto.
 const MAX_STATS: usize = 100;
-/// A chunk of audio data who's lifetime is managed via reference counting.
-type Chunk<T> = Arc<[T; CHUNK_SIZE]>;
-/// Allocates and returns a new Chunk.
-fn new_chunk<T: Sample>() -> Chunk<T> {
-    Arc::new([T::from::<i16>(&0); CHUNK_SIZE])
+/// Data associated with each chunk
+pub struct ChunkData<T> {
+    audio: [T; CHUNK_SIZE],
+    envelope: [T; ENV_SIZE],
+    channels: cpal::ChannelCount,
 }
-/// Coordinates the flow of audio and statistics through use of multiple
-/// channels.
+/// A chunk of audio data who's lifetime is managed via reference counting.
+type Chunk<T> = Arc<ChunkData<T>>;
+/// Allocates and returns a new Chunk.
+fn new_chunk<T: Sample>(channels: cpal::ChannelCount) -> Chunk<T> {
+    Arc::new(ChunkData {
+        // TODO: use new_uninit() for efficiency
+        audio: [T::from::<i16>(&0); CHUNK_SIZE],
+        envelope: [T::from::<i16>(&0); ENV_SIZE],
+        channels,
+    })
+}
+
+/// Coordinates the flow of audio data and statistics through use of multiple
+/// channels. Takes care of storing the audio data too (FIXME: I'll likely
+/// eventually rename this again?).
 pub struct Coordinator<T: Sample> {
     chunk_receiver: mpsc::Receiver<Chunk<T>>,
     request_receiver: mpsc::Receiver<CoordinatorRequest<T>>,
@@ -536,6 +583,12 @@ impl<T: Sample> Coordinator<T> {
         // hacky: we do a blocking read for frame stats, relying on them being
         // sent regularly (unlike requests). We also expect they're sent more
         // often than chunks.
+
+        // This suggests using crossbeam instead:
+        // https://users.rust-lang.org/t/how-to-select-channels/26096/14 - I
+        // think I should switch to using a single channel in the coordinator
+        // (perhaps pass the Coordinator to classes' constructor, such that they
+        // can ask the Coordinator for a Sender).
         loop {
             while let Ok(chunk) = self.chunk_receiver.try_recv() {
                 self.chunks_pos = self.chunks_pos + 1;
@@ -564,5 +617,23 @@ impl<T: Sample> Coordinator<T> {
                 Err(why) => panic!("{:?}", why),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn multi_channel_chunks() {
+        let chunk = super::new_chunk::<i16>(1);
+        assert_eq!(chunk.channels, 1);
+
+        let chunk = super::new_chunk::<f32>(2);
+        assert_eq!(chunk.channels, 2);
+
+        let chunk = super::new_chunk::<u16>(3);
+        assert_eq!(chunk.channels, 3);
+
+        let chunk = super::new_chunk::<i16>(4);
+        assert_eq!(chunk.channels, 4);
     }
 }
