@@ -89,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             routes![
                 webui::index,
                 webui::stats,
+                webui::status,
                 webui::hi_world,
                 webui::dart_files
             ],

@@ -14,6 +14,7 @@ impl Sample for u16 {}
 /// Requests for the Coordinator.
 pub enum CoordinatorRequest<T: Sample> {
     StatsRequest { resp: mpsc::Sender<FrameStats<T>> },
+    StatusInfoRequest { resp: mpsc::Sender<StatusInfo<T>> },
 }
 
 /// Errors produced by the Controller.
@@ -46,6 +47,20 @@ impl<T: Sample> Controller<T> {
     pub fn get_frame_stats(&self) -> ControllerResult<FrameStats<T>, T> {
         let (resp_sender, resp_receiver) = mpsc::channel();
         let req = CoordinatorRequest::StatsRequest {
+            resp: resp_sender.clone(),
+        };
+        match self.req_sender.send(req) {
+            Err(why) => Err(ControllerError::SendError { e: why }),
+            Ok(()) => match resp_receiver.recv() {
+                Err(why) => Err(ControllerError::RecvError { e: why }),
+                Ok(result) => Ok(result),
+            },
+        }
+    }
+
+    pub fn get_status(&self) -> ControllerResult<StatusInfo<T>, T> {
+        let (resp_sender, resp_receiver) = mpsc::channel();
+        let req = CoordinatorRequest::StatusInfoRequest {
             resp: resp_sender.clone(),
         };
         match self.req_sender.send(req) {
@@ -224,7 +239,7 @@ impl<'a> AudioPlumbing<'a> {
         let mut sample_count: usize = 0;
         let mut env_idx: usize = 0;
         // TODO: use new_unint() for efficiency:
-        let mut env_acc: [f32; MAX_CHANNELS] = [0.0; MAX_CHANNELS];
+        let mut env_acc: [u32; MAX_CHANNELS] = [0; MAX_CHANNELS];
         let mut env_count: usize = 0;
         let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
             // TODO: move to stats that are available on-demand:
@@ -246,14 +261,20 @@ impl<'a> AudioPlumbing<'a> {
                 for &sample in frame {
                     c.audio[sample_count] = sample;
                     sample_count += 1;
-                    env_acc[chan] += sample;
+                    let s: i16 = cpal::Sample::from::<f32>(&sample);
+                    // See SAMPLE_SCALE_FACTOR TODO above.
+                    let s = s / SAMPLE_SCALE_FACTOR;
+                    let ss = (s * s) as u32;
+                    env_acc[chan] += ss;
                     chan += 1;
                 }
                 env_count += 1;
 
                 if env_count == DOWNSAMPLE_WINDOW {
                     for chan in 0..channels.into() {
-                        c.envelope[env_idx] = env_acc[chan] / DOWNSAMPLE_WINDOW as f32;
+                        let rms = ((env_acc[chan] as f32 / DOWNSAMPLE_WINDOW as f32).sqrt()
+                            * SAMPLE_SCALE_FACTOR as f32) as i16;
+                        c.envelope[env_idx] = cpal::Sample::from::<i16>(&rms);
                         env_idx += 1;
                     }
                     env_count = 0;
@@ -421,7 +442,14 @@ impl CpalDiagnostics {
     }
 }
 
+pub struct StatusInfo<T> {
+    pub saved_blocks: usize,
+    pub last_chunk: Arc<ChunkData<T>>,
+}
+
 const MAX_CHANNELS: usize = 2;
+// TODO: TO TEST: if SAMPLE_SCALE_FACTOR is too small, "(s * s) as u32" below
+// may overflow. Demonstrate this in a test and fix the casting logic.
 const SAMPLE_SCALE_FACTOR: i16 = 256;
 #[derive(Clone, Debug)]
 pub struct FrameStats<T: Sample> {
@@ -473,6 +501,7 @@ impl<'a, T: 'a + Sample> FrameStats<T> {
                         }
                     }
                     let s: i16 = cpal::Sample::from::<T>(s);
+                    // See SAMPLE_SCALE_FACTOR TODO above.
                     let s = s / SAMPLE_SCALE_FACTOR;
                     let ss = (s * s) as u32;
                     self.acc[c] += ss; // TODO: deal with overflow!
@@ -528,8 +557,8 @@ const MAX_STATS: usize = 100;
 /// Data associated with each chunk
 pub struct ChunkData<T> {
     audio: [T; CHUNK_SIZE],
-    envelope: [T; ENV_SIZE],
-    channels: cpal::ChannelCount,
+    pub envelope: [T; ENV_SIZE],
+    pub channels: cpal::ChannelCount,
 }
 /// A chunk of audio data who's lifetime is managed via reference counting.
 type Chunk<T> = Arc<ChunkData<T>>;
@@ -602,6 +631,13 @@ impl<T: Sample> Coordinator<T> {
                 match req {
                     CoordinatorRequest::StatsRequest { resp } => {
                         resp.send(self.stats[self.stats_pos - 1].clone()).unwrap()
+                    }
+                    CoordinatorRequest::StatusInfoRequest { resp } => {
+                        let response = StatusInfo {
+                            saved_blocks: self.chunks.len(),
+                            last_chunk: self.chunks[self.chunks_pos - 1].clone(),
+                        };
+                        resp.send(response).unwrap()
                     }
                 }
             }
