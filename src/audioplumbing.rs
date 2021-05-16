@@ -180,6 +180,106 @@ impl<'b, T: Sample + 'b> SimpleLooper<T> {
     }
 }
 
+fn get_data_callback<'a>(
+    channels: cpal::ChannelCount,
+    chunk_sender: mpsc::Sender<Arc<ChunkData<f32>>>,
+) -> impl FnMut(&[f32]) + 'a {
+    let mut chunk = new_chunk(channels);
+    let mut sample_count: usize = 0;
+    let mut env_idx: usize = 0;
+    // TODO: use new_unint() for efficiency:
+    let mut env_acc: [u64; MAX_CHANNELS] = [0; MAX_CHANNELS];
+    let mut env_count: usize = 0;
+    let inp_fn = move |data: &[f32]| {
+        input_fn(
+            channels,
+            &chunk_sender,
+            &mut chunk,
+            &mut sample_count,
+            &mut env_idx,
+            &mut env_acc,
+            &mut env_count,
+            data,
+        )
+    };
+    inp_fn
+}
+
+fn input_fn<'a>(
+    channels: cpal::ChannelCount,
+    chunk_sender: &'a mpsc::Sender<Arc<ChunkData<f32>>>,
+    chunk: &'a mut Arc<ChunkData<f32>>,
+    sample_count: &'a mut usize,
+    env_idx: &'a mut usize,
+    env_acc: &'a mut [u64; MAX_CHANNELS],
+    env_count: &'a mut usize,
+    data: &[f32],
+) {
+    // eprintln!("input_fn with data len {}", data.len());
+    if data.len() == 0 {
+        println!("Dropping chunk_sender!");
+        drop(chunk_sender);
+        return;
+    }
+    assert_eq!(data.len() % channels as usize, 0);
+    for frame in data.chunks_exact(channels.into()) {
+        // Review: is get_mut(...).unwrap() cheap? Can we somehow
+        // move such binding to outside the for-loop, then somehow
+        // unbind when we want to send(chunk.clone())? drop()?
+        //
+        // TODO: Error message for calling Arc::get_mut(&mut chunk) here is
+        // confusing:
+        let c = Arc::get_mut(chunk).unwrap();
+
+        // TODO: benchmark! Float ops vs integer ops, on PC and on ARM
+        // (Raspberry Pi). Currently we're calculating RMS via u64: samples
+        // converted from f32 to i16, squaring in i32, summing in u64. then sqrt
+        // via f32 again, back to i16, and converting back to f32.
+        let mut chan = 0; // TODO: figure out enumerate() for (i, &sample)?
+        for &sample in frame {
+            c.get_audio()[*sample_count] = sample;
+            *sample_count += 1;
+            let sample_i16: i16 = cpal::Sample::from::<f32>(&sample);
+            let s = sample_i16 as i32;
+            let ss = s * s;
+            env_acc[chan] += ss as u64;
+            chan += 1;
+            // TODO: when doing a benchmark with f32, check impact on
+            // calculation accuracy too. This println shows the int calculation:
+            //
+            // println!(
+            //     "sample {} -> {}; s {}, ss {}, back: {}, back back: {}",
+            //     sample,
+            //     sample_i16,
+            //     s,
+            //     ss,
+            //     ((ss as f32).sqrt()) as i16,
+            //     <i16 as cpal::Sample>::to_f32(&(((ss as f32).sqrt()) as i16))
+            // );
+        }
+        *env_count += 1;
+
+        if *env_count == DOWNSAMPLE_WINDOW {
+            for chan in 0..channels.into() {
+                let rms = ((env_acc[chan] as f32 / DOWNSAMPLE_WINDOW as f32).sqrt()) as i16;
+                c.get_envelope()[*env_idx] = cpal::Sample::from::<i16>(&rms);
+                env_acc[chan] = 0;
+                *env_idx += 1;
+            }
+            *env_count = 0;
+        }
+
+        if *sample_count >= CHUNK_SIZE {
+            assert_eq!(*env_count, 0);
+            assert_eq!(*env_idx, ENV_SIZE);
+            chunk_sender.send(chunk.clone()).unwrap();
+            *chunk = new_chunk(channels);
+            *sample_count = 0;
+            *env_idx = 0;
+        }
+    }
+}
+
 /// Handles CPAL stream errrors.
 fn err_fn(err: cpal::StreamError) {
     eprintln!(
@@ -224,7 +324,7 @@ impl<'a> AudioPlumbing<'a> {
     /// Sends FrameStats via fs_sender.
     pub fn play(
         &mut self,
-        chunk_sender: mpsc::Sender<Chunk<f32>>,
+        chunk_sender: mpsc::Sender<Arc<ChunkData<f32>>>,
         fs_sender: mpsc::Sender<FrameStats<f32>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let channels = self.config.channels;
@@ -235,12 +335,14 @@ impl<'a> AudioPlumbing<'a> {
         let looper1 = SimpleLooper::<f32>::new(self.delay_ms, self.config);
         let (mut looper1_input_fn, mut looper1_output_fn) = looper1.get_data_callbacks();
 
-        let mut chunk = new_chunk(channels);
-        let mut sample_count: usize = 0;
-        let mut env_idx: usize = 0;
-        // TODO: use new_unint() for efficiency:
-        let mut env_acc: [u32; MAX_CHANNELS] = [0; MAX_CHANNELS];
-        let mut env_count: usize = 0;
+        let mut chunker_input_fn = get_data_callback(channels, chunk_sender);
+
+        // let mut chunk = new_chunk(channels);
+        // let mut sample_count: usize = 0;
+        // let mut env_idx: usize = 0;
+        // // TODO: use new_unint() for efficiency:
+        // let mut env_acc: [u32; MAX_CHANNELS] = [0; MAX_CHANNELS];
+        // let mut env_count: usize = 0;
         let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
             // TODO: move to stats that are available on-demand:
             // println!("input count {}    info: {:?}", data.len(), inpinf);
@@ -251,53 +353,17 @@ impl<'a> AudioPlumbing<'a> {
             assert_eq!(data.len() % channels as usize, 0);
             for frame in data.chunks_exact(channels.into()) {
                 fs.consume_frame(&mut frame.iter());
-
-                // Review: is get_mut(...).unwrap() cheap? Can we somehow
-                // move such binding to outside the for-loop, then somehow
-                // unbind when we want to send(chunk.clone())? drop()?
-                let c = Arc::get_mut(&mut chunk).unwrap();
-
-                let mut chan = 0; // TODO: figure out enumerate() for (i, &sample)?
-                for &sample in frame {
-                    c.audio[sample_count] = sample;
-                    sample_count += 1;
-                    let s: i16 = cpal::Sample::from::<f32>(&sample);
-                    // See SAMPLE_SCALE_FACTOR TODO above.
-                    let s = s / SAMPLE_SCALE_FACTOR;
-                    let ss = (s * s) as u32;
-                    env_acc[chan] += ss;
-                    chan += 1;
-                }
-                env_count += 1;
-
-                if env_count == DOWNSAMPLE_WINDOW {
-                    for chan in 0..channels.into() {
-                        let rms = ((env_acc[chan] as f32 / DOWNSAMPLE_WINDOW as f32).sqrt()
-                            * SAMPLE_SCALE_FACTOR as f32) as i16;
-                        c.envelope[env_idx] = cpal::Sample::from::<i16>(&rms);
-                        env_idx += 1;
-                    }
-                    env_count = 0;
-                }
-
-                if sample_count >= CHUNK_SIZE {
-                    assert_eq!(env_count, 0);
-                    assert_eq!(env_idx, ENV_SIZE);
-                    chunk_sender.send(chunk.clone()).unwrap();
-                    chunk = new_chunk(channels);
-                    sample_count = 0;
-                    env_idx = 0;
-                }
             }
             // Sending fs: this is a move. We can't use it again. Different
             // lifetime conditions than chunk.
             fs_sender.send(fs).unwrap();
 
+            chunker_input_fn(data);
             looper1_input_fn(data, inpinf);
         };
 
         let output_data_fn = move |data: &mut [f32], outinf: &cpal::OutputCallbackInfo| {
-            // Performane thoughts: we don't want to call a bunch of functions
+            // Performance thoughts: we don't want to call a bunch of functions
             // for every sample: function call overhead. We also don't want to
             // invalidate the fastest cache for every function call. Thus the
             // number of frames we want to process with each function call
@@ -540,6 +606,16 @@ impl<T: Sample> FrameStats<T> {
     }
 }
 
+pub trait ChunkTrait<'a, T: Sample> {
+    /// Produces a new chunk
+    fn new(channels: cpal::ChannelCount) -> Self;
+    fn get_audio(&'a mut self) -> &'a mut [T];
+    fn get_ro_audio(&'a self) -> &'a [T];
+    fn get_envelope(&'a mut self) -> &'a mut [T];
+    fn get_ro_envelope(&'a self) -> &'a [T];
+    fn get_channels(&self) -> cpal::ChannelCount;
+}
+
 /// Number of samples to combine to produce comparatively low sampling rate
 /// envelope, and for other calculations where lower sampling rate makes sense
 /// for efficiency.
@@ -557,13 +633,45 @@ const MAX_STATS: usize = 100;
 /// Data associated with each chunk
 pub struct ChunkData<T> {
     audio: [T; CHUNK_SIZE],
-    pub envelope: [T; ENV_SIZE],
-    pub channels: cpal::ChannelCount,
+    envelope: [T; ENV_SIZE],
+    channels: cpal::ChannelCount,
 }
+
+impl<'a, T: Sample> ChunkTrait<'a, T> for ChunkData<T> {
+    fn new(channels: cpal::ChannelCount) -> Self {
+        Self {
+            // TODO: use new_uninit() for efficiency
+            audio: [T::from::<i16>(&0); CHUNK_SIZE],
+            envelope: [T::from::<i16>(&0); ENV_SIZE],
+            channels,
+        }
+    }
+
+    fn get_audio(&'a mut self) -> &'a mut [T] {
+        &mut self.audio
+    }
+
+    fn get_ro_audio(&'a self) -> &'a [T] {
+        &self.audio
+    }
+
+    fn get_envelope(&'a mut self) -> &'a mut [T] {
+        &mut self.envelope
+    }
+
+    fn get_ro_envelope(&'a self) -> &'a [T] {
+        &self.envelope
+    }
+
+    fn get_channels(&self) -> cpal::ChannelCount {
+        self.channels
+    }
+}
+
 /// A chunk of audio data who's lifetime is managed via reference counting.
-type Chunk<T> = Arc<ChunkData<T>>;
+// type Chunk<T> = Arc<ChunkData<T>>;
 /// Allocates and returns a new Chunk.
-fn new_chunk<T: Sample>(channels: cpal::ChannelCount) -> Chunk<T> {
+fn new_chunk<T: Sample>(channels: cpal::ChannelCount) -> Arc<ChunkData<T>> {
     Arc::new(ChunkData {
         // TODO: use new_uninit() for efficiency
         audio: [T::from::<i16>(&0); CHUNK_SIZE],
@@ -576,17 +684,17 @@ fn new_chunk<T: Sample>(channels: cpal::ChannelCount) -> Chunk<T> {
 /// channels. Takes care of storing the audio data too (FIXME: I'll likely
 /// eventually rename this again?).
 pub struct Coordinator<T: Sample> {
-    chunk_receiver: mpsc::Receiver<Chunk<T>>,
+    chunk_receiver: mpsc::Receiver<Arc<ChunkData<T>>>,
     request_receiver: mpsc::Receiver<CoordinatorRequest<T>>,
     frame_stats_receiver: mpsc::Receiver<FrameStats<T>>,
-    chunks: Vec<Chunk<T>>,
+    chunks: Vec<Arc<ChunkData<T>>>,
     chunks_pos: usize,
     stats: Vec<FrameStats<T>>,
     stats_pos: usize,
 }
 impl<T: Sample> Coordinator<T> {
     pub fn new(
-        chunk_receiver: mpsc::Receiver<Chunk<T>>,
+        chunk_receiver: mpsc::Receiver<Arc<ChunkData<T>>>,
         request_receiver: mpsc::Receiver<CoordinatorRequest<T>>,
         frame_stats_receiver: mpsc::Receiver<FrameStats<T>>,
     ) -> Coordinator<T> {
@@ -671,5 +779,99 @@ mod tests {
 
         let chunk = super::new_chunk::<i16>(4);
         assert_eq!(chunk.channels, 4);
+    }
+
+    macro_rules! assert_delta {
+        ($x:expr, $y:expr, $d:expr) => {
+            assert!(
+                ($x - $y).abs() < $d,
+                "{} != {} despite permissible delta {}",
+                $x,
+                $y,
+                $d
+            );
+        };
+    }
+
+    #[test]
+    fn chunker() {
+        use std::sync::mpsc;
+
+        let (sender, receiver) = mpsc::channel();
+        let mut chunker_input_fn = super::get_data_callback(2, sender);
+
+        assert_eq!(super::DOWNSAMPLE_WINDOW, 360);
+        chunker_input_fn(&[0.3; 360 * 3]);
+        // // TODO: Why does this not work?
+        // chunker_input_fn(&[]);
+        chunker_input_fn(&[0.5; 360 * 3]);
+        chunker_input_fn(&[0.1; 360 * 2]);
+        let mut stereo = [0.1; 360 * 2];
+        for i in 0..360 {
+            stereo[i * 2] = 0.3;
+        }
+        chunker_input_fn(&stereo);
+        chunker_input_fn(&[-0.2; 4000]);
+        chunker_input_fn(&[0.9; 4000]);
+        // // Useful when working with debug output inside input_fn:
+        // chunker_input_fn(&[0.1, 0.3, 0.5, 0.9, -0.1, -0.9]);
+
+        let chunk: super::Arc<super::ChunkData<f32>> = receiver.recv().unwrap();
+        let mut expected1 = [0.3; super::CHUNK_SIZE];
+        for i in 360 * 3..360 * 6 {
+            expected1[i] = 0.5;
+        }
+        for i in 360 * 6..360 * 8 {
+            expected1[i] = 0.1;
+        }
+        for i in 360 * 8..360 * 10 {
+            if i % 2 == 0 {
+                expected1[i] = 0.3;
+            } else {
+                expected1[i] = 0.1;
+            }
+        }
+        for i in 360 * 10..7600 {
+            expected1[i] = -0.2;
+        }
+        for i in 7600..super::CHUNK_SIZE {
+            expected1[i] = 0.9;
+        }
+        println!("envelope: {:?}", chunk.envelope);
+        // // Fail in order to ensure output is printed:
+        // assert!(false);
+        assert_eq!(chunk.audio, expected1);
+        // Explicit envelope values, for comparison with other platforms or
+        // implementations:
+        assert_eq!(
+            chunk.envelope,
+            [
+                0.29999694, 0.29999694, 0.41227454, 0.41227454, 0.49998474, 0.49998474, 0.09997864,
+                0.09997864, 0.29999694, 0.09997864, 0.1999878, 0.1999878, 0.1999878, 0.1999878,
+                0.1999878, 0.1999878, 0.1999878, 0.1999878, 0.1999878, 0.1999878, 0.6182135,
+                0.6182135, 0.89999086, 0.89999086, 0.89999086, 0.89999086, 0.89999086, 0.89999086,
+                0.89999086, 0.89999086, 0.89999086, 0.89999086
+            ]
+        );
+        assert_delta!(chunk.envelope[0], 0.3, 0.00001);
+        assert_delta!(chunk.envelope[1], 0.3, 0.00001);
+        assert_delta!(
+            chunk.envelope[2],
+            (((0.3 as f32 * 0.3) + (0.5 * 0.5)) / 2.0).sqrt(),
+            0.0001
+        );
+        assert_delta!(
+            chunk.envelope[3],
+            (((0.3 as f32 * 0.3) + (0.5 * 0.5)) / 2.0).sqrt(),
+            0.0001
+        );
+        assert_delta!(chunk.envelope[4], 0.5, 0.00002);
+        assert_delta!(chunk.envelope[5], 0.5, 0.00002);
+        assert_delta!(chunk.envelope[6], 0.1, 0.00003);
+        assert_delta!(chunk.envelope[7], 0.1, 0.00003);
+        assert_delta!(chunk.envelope[8], 0.3, 0.00001);
+        assert_delta!(chunk.envelope[9], 0.1, 0.00003);
+        assert_delta!(chunk.envelope[10], 0.2, 0.00002);
+        assert_delta!(chunk.envelope[11], 0.2, 0.00002);
     }
 }

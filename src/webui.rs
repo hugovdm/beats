@@ -31,7 +31,8 @@ pub fn status(controller: State<audioplumbing::Controller<f32>>) -> String {
     match controller.get_status() {
         Ok(status_info) => {
             let mut s = String::new();
-            for env_val in status_info.last_chunk.envelope.iter() {
+            use audioplumbing::ChunkTrait;
+            for env_val in status_info.last_chunk.get_ro_envelope().iter() {
                 writeln!(s, "{}", env_val).unwrap();
                 let scalefactor: i16 = 256; // FIXME
                 let e: i16 = cpal::Sample::to_i16(env_val) / scalefactor;
@@ -42,7 +43,9 @@ pub fn status(controller: State<audioplumbing::Controller<f32>>) -> String {
             }
             format!(
                 "{}\n- {:?} saved blocks\n{} channels\nFIXME JSON, BSON, BJSON?",
-                s, status_info.saved_blocks, status_info.last_chunk.channels
+                s,
+                status_info.saved_blocks,
+                status_info.last_chunk.get_channels()
             )
         }
         Err(why) => format!("error getting frame stats: {:?}", why),
