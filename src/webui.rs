@@ -6,6 +6,22 @@ use rocket::{
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+#[get("/metrics")]
+pub fn metrics() -> String {
+    let mut buffer = Vec::new();
+    let encoder = prometheus::TextEncoder::new();
+
+    // Gather the metrics.
+    let metric_families = prometheus::gather();
+
+    // Encode them to send.
+    // use prometheus::{self, Encoder, TextEncoder};
+    use prometheus::Encoder;
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+
+    String::from_utf8(buffer.clone()).unwrap()
+}
+
 #[get("/")]
 pub fn index() -> content::Html<String> {
     content::Html(format!(

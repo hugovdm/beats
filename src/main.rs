@@ -5,6 +5,11 @@
 #[macro_use]
 extern crate rocket;
 
+#[macro_use]
+extern crate lazy_static;
+#[macro_use]
+extern crate prometheus;
+
 use cpal::traits::{DeviceTrait, HostTrait};
 use std::thread;
 
@@ -87,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .mount(
             "/",
             routes![
+                webui::metrics,
                 webui::index,
                 webui::stats,
                 webui::status,

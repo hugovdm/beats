@@ -7,10 +7,13 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+default = ["prometheus/process"]
 jack = ["cpal/jack"]
 
 [dependencies]
 cpal = "0.13.1"
+lazy_static = "1.4.0"
+prometheus = "0.12.0"
 ringbuf = "0.2"
 rocket = "0.4.5"
 thread-id = "3.3.0"

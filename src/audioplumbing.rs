@@ -2,6 +2,24 @@ use std::ops::AddAssign;
 use std::sync::mpsc;
 use std::sync::Arc;
 
+const BUCKETS: [f64; 14] = [
+    100., 200., 400., 700., 1000., 1300., 1600., 1900., 2200., 2500., 2800., 3100., 3500., 4000.,
+];
+lazy_static! {
+    static ref AUDIO_INPUT_BLOCK_SAMPLES_HISTOGRAM: prometheus::Histogram = register_histogram!(
+        "audio_input_block_samples",
+        "Number of input audio samples in each input block",
+        BUCKETS.to_vec()
+    )
+    .unwrap();
+    static ref AUDIO_OUTPUT_BLOCK_SAMPLES_HISTOGRAM: prometheus::Histogram = register_histogram!(
+        "audio_output_block_samples",
+        "Number of output audio samples in each output block",
+        BUCKETS.to_vec()
+    )
+    .unwrap();
+}
+
 pub trait Sample:
     cpal::Sample + PartialEq + PartialOrd + AddAssign + Send + std::fmt::Display + std::fmt::Debug
 {
@@ -300,7 +318,6 @@ pub struct AudioPlumbing<'a> {
     output_stream: Option<cpal::Stream>,
 }
 
-use thread_id;
 impl<'a> AudioPlumbing<'a> {
     pub fn new(
         input_device: &'a cpal::Device,
@@ -329,8 +346,8 @@ impl<'a> AudioPlumbing<'a> {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let channels = self.config.channels;
 
-        let mut inp_diagnostics = CpalDiagnostics::empty("input");
-        let mut out_diagnostics = CpalDiagnostics::empty("output");
+        // let mut inp_diagnostics = CpalDiagnostics::empty("input");
+        // let mut out_diagnostics = CpalDiagnostics::empty("output");
 
         let looper1 = SimpleLooper::<f32>::new(self.delay_ms, self.config);
         let (mut looper1_input_fn, mut looper1_output_fn) = looper1.get_data_callbacks();
@@ -344,10 +361,15 @@ impl<'a> AudioPlumbing<'a> {
         // let mut env_acc: [u32; MAX_CHANNELS] = [0; MAX_CHANNELS];
         // let mut env_count: usize = 0;
         let input_data_fn = move |data: &[f32], inpinf: &cpal::InputCallbackInfo| {
-            // TODO: move to stats that are available on-demand:
-            // println!("input count {}    info: {:?}", data.len(), inpinf);
-            inp_diagnostics
-                .diagnose_capture(inpinf.timestamp().callback, inpinf.timestamp().capture);
+            AUDIO_INPUT_BLOCK_SAMPLES_HISTOGRAM.observe(data.len() as f64);
+
+            // // TODO: move to stats that are available on-demand:
+            // inp_diagnostics.diagnose_capture(
+            //     inpinf.timestamp().callback,
+            //     inpinf.timestamp().capture,
+            //     data.len(),
+            // );
+
             // TODO: don't reset fs every period.
             let mut fs = FrameStats::new(channels);
             assert_eq!(data.len() % channels as usize, 0);
@@ -371,14 +393,14 @@ impl<'a> AudioPlumbing<'a> {
             // running on. Find good ways to benchmark and select "number of
             // frames per function call"?
 
-            println!(
-                "thread {}: output count {} info {:?}",
-                thread_id::get(),
-                data.len(),
-                outinf
-            );
-            out_diagnostics
-                .diagnose_playback(outinf.timestamp().callback, outinf.timestamp().playback);
+            AUDIO_OUTPUT_BLOCK_SAMPLES_HISTOGRAM.observe(data.len() as f64);
+
+            // out_diagnostics.diagnose_playback(
+            //     outinf.timestamp().callback,
+            //     outinf.timestamp().playback,
+            //     data.len(),
+            // );
+
             assert_eq!(data.len() % channels as usize, 0);
             // First we initialize the buffer, such that other function calls
             // have initialized values. (The buffer doesn't start out empty -
@@ -449,7 +471,12 @@ impl CpalDiagnostics {
         }
     }
 
-    fn diagnose_capture(&mut self, callback: cpal::StreamInstant, capture: cpal::StreamInstant) {
+    fn diagnose_capture(
+        &mut self,
+        callback: cpal::StreamInstant,
+        capture: cpal::StreamInstant,
+        samples: usize,
+    ) {
         if self.first == None {
             if callback.duration_since(&capture).is_some() {
                 self.first = Some(capture);
@@ -459,9 +486,10 @@ impl CpalDiagnostics {
             }
         }
         print!(
-            "thread {}: {} timestamps: callback: {:?}, capture: {:?}",
+            "thread {}: {} count {} - timestamps: callback: {:?}, capture: {:?}",
             thread_id::get(),
             self.ident,
+            samples,
             callback.duration_since(&self.first.unwrap()).unwrap(),
             capture.duration_since(&self.first.unwrap()).unwrap(),
         );
@@ -478,7 +506,12 @@ impl CpalDiagnostics {
         self.capture = Some(capture);
     }
 
-    fn diagnose_playback(&mut self, callback: cpal::StreamInstant, playback: cpal::StreamInstant) {
+    fn diagnose_playback(
+        &mut self,
+        callback: cpal::StreamInstant,
+        playback: cpal::StreamInstant,
+        samples: usize,
+    ) {
         if self.first == None {
             if callback.duration_since(&playback).is_some() {
                 self.first = Some(playback);
@@ -488,9 +521,10 @@ impl CpalDiagnostics {
             }
         }
         print!(
-            "thread {}: {} timestamps: callback: {:?}, playback: {:?}",
+            "thread {}: {} count {} - timestamps: callback: {:?}, playback: {:?}",
             thread_id::get(),
             self.ident,
+            samples,
             callback.duration_since(&self.first.unwrap()).unwrap(),
             playback.duration_since(&self.first.unwrap()).unwrap(),
         );
