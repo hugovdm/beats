@@ -94,6 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             routes![
                 webui::metrics,
                 webui::index,
+                webui::bson_env_chunk,
+                webui::json_env_chunk,
+                webui::json_envelope,
                 webui::stats,
                 webui::status,
                 webui::hi_world,

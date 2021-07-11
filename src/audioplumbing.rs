@@ -33,6 +33,7 @@ impl Sample for u16 {}
 pub enum CoordinatorRequest<T: Sample> {
     StatsRequest { resp: mpsc::Sender<FrameStats<T>> },
     StatusInfoRequest { resp: mpsc::Sender<StatusInfo<T>> },
+    EnvelopeRequest { resp: mpsc::Sender<Envelope<T>> },
 }
 
 /// Errors produced by the Controller.
@@ -79,6 +80,20 @@ impl<T: Sample> Controller<T> {
     pub fn get_status(&self) -> ControllerResult<StatusInfo<T>, T> {
         let (resp_sender, resp_receiver) = mpsc::channel();
         let req = CoordinatorRequest::StatusInfoRequest {
+            resp: resp_sender.clone(),
+        };
+        match self.req_sender.send(req) {
+            Err(why) => Err(ControllerError::SendError { e: why }),
+            Ok(()) => match resp_receiver.recv() {
+                Err(why) => Err(ControllerError::RecvError { e: why }),
+                Ok(result) => Ok(result),
+            },
+        }
+    }
+
+    pub fn get_envelope(&self) -> ControllerResult<Envelope<T>, T> {
+        let (resp_sender, resp_receiver) = mpsc::channel();
+        let req = CoordinatorRequest::EnvelopeRequest {
             resp: resp_sender.clone(),
         };
         match self.req_sender.send(req) {
@@ -547,6 +562,48 @@ pub struct StatusInfo<T> {
     pub last_chunk: Arc<ChunkData<T>>,
 }
 
+pub struct Envelope<T> {
+    // TODO: we're returning all ChunkData. We could return only envelope data.
+    // However ref counting is happening on ChunkData granularity - is there a
+    // neat way to embed a ref counter on a subset of the data? Would it help at
+    // all?
+    env_chunks: Vec<Arc<ChunkData<T>>>,
+}
+
+impl<T: Sample> Envelope<T> {
+    pub fn iter(&self) -> EnvelopeIter<T> {
+        EnvelopeIter {
+            env: self,
+            pos: 0,
+            itr: self.env_chunks[0].get_ro_envelope().iter(),
+        }
+    }
+}
+
+pub struct EnvelopeIter<'a, T> {
+    env: &'a Envelope<T>,
+    // Index into env_chunk which itr currently points at
+    pos: usize,
+    itr: std::slice::Iter<'a, T>,
+}
+
+impl<'a, T: Sample> Iterator for EnvelopeIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut i = self.itr.next();
+        while i.is_none() {
+            self.pos += 1;
+            if self.pos >= self.env.env_chunks.len() {
+                break;
+            }
+            self.itr = self.env.env_chunks[self.pos].get_ro_envelope().iter();
+            i = self.itr.next();
+        }
+        i
+    }
+}
+
 const MAX_CHANNELS: usize = 2;
 // TODO: TO TEST: if SAMPLE_SCALE_FACTOR is too small, "(s * s) as u32" below
 // may overflow. Demonstrate this in a test and fix the casting logic.
@@ -655,7 +712,7 @@ pub trait ChunkTrait<'a, T: Sample> {
 /// for efficiency.
 const DOWNSAMPLE_WINDOW: usize = 360;
 /// Number of samples in the envelope in each Chunk.
-const ENV_SIZE: usize = 32;
+const ENV_SIZE: usize = 96; // FIXME: bumping this up to 128 can result in a segfault?
 /// Total number of audio samples in a Chunk. This must be a multiple of the
 /// number of channels (number of samples in a frame).
 const CHUNK_SIZE: usize = DOWNSAMPLE_WINDOW * ENV_SIZE;
@@ -779,6 +836,20 @@ impl<T: Sample> Coordinator<T> {
                             saved_blocks: self.chunks.len(),
                             last_chunk: self.chunks[self.chunks_pos - 1].clone(),
                         };
+                        resp.send(response).unwrap()
+                    }
+                    CoordinatorRequest::EnvelopeRequest { resp } => {
+                        let mut response = Envelope {
+                            env_chunks: Vec::with_capacity(10),
+                        };
+                        for i in 0..20 {
+                            if self.chunks_pos + i < 20 {
+                                continue;
+                            }
+                            response
+                                .env_chunks
+                                .push(self.chunks[self.chunks_pos + i - 20].clone());
+                        }
                         resp.send(response).unwrap()
                     }
                 }

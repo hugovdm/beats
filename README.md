@@ -7,18 +7,14 @@ processing code and ideas that tickle my fancy.
 ## Current status
 I'm essentially busy figuring out the tech stack. The app runs a feedback loop
 like in cpal's examples/feedback.rs. By default, it plays back what it picked up
-via the microphone, with a 1 second delay.
+via the microphone, with a 1 second delay (flag-adjustable).
 
-It also starts up a window and prints "wgpu_glyph" to it: when this window is
-closed, the loop terminates. Throwing this out is probably the next change.
+It also runs a Rocket-based webserver which serves various pages, including some
+Dart code able to render an envelope of the last few seconds of audio.
 
 ## Roadmap
 Things I'm likely to do next:
 
-* Rocket-based web server to serve a Dart-based UI.
-  * Figuring out the tech stack: ability to interact with it via various devices
-    (e.g. mobile phones) while the software could be running on e.g. a headless
-    and input-device-less Raspberry Pi.
 * Frequency sweep to measure the round-trip gain at various frequencies, and set
   gain based on that. (Open-loop automatic gain determination, I don't want to
   delve into closed-loop control systems at this time. :-)
@@ -30,7 +26,7 @@ Things I'm likely to do next:
     support which resonant frequencies, and how various interventions might help
     for improving the accoustic properties of the rooms?
 * Beat detection - e.g. measuring the tempo.
-* Recording for many minutes rather than just looping via a ring buffer.
+* Playing back from the recording, rather than just looping via a ring buffer.
   * Will permit playing back more selectively.
 * Loop detection: see when something is repeated.
   * I wish to have the feedback delay determined by the measurement of a loop
@@ -45,8 +41,19 @@ Things I'm likely to do next:
   undocumented, since I'm likely to never get that far, or for it to not really
   work as dreamed.)
 
+## Building Dart UI
+These instructions are probably not complete (an explicit `pub get` might be
+needed? - TBD):
+```sh
+cd dart
+pub global activate webdev
+webdev build
+cd ..
+```
+
 ## Running
-Use of Rocket means we need to use nightly Rust rather than stable:
+Since the project is not on Rocket v0.5+ yet, it currently still needs nightly
+Rust rather than stable:
 ```
 $ rustup override set nightly
 ```

@@ -11,7 +11,9 @@ default = ["prometheus/process"]
 jack = ["cpal/jack"]
 
 [dependencies]
+bson = "2.0.0-beta.2"
 cpal = "0.13.1"
+json = "0.12.4"
 lazy_static = "1.4.0"
 prometheus = "0.12.0"
 ringbuf = "0.2"

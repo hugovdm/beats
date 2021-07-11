@@ -1,4 +1,3 @@
-A simple [StageXL](http://www.stagexl.org/) app.
+Development frontend for the beats project.
 
-Created from templates made available by Stagehand under a BSD-style
-[license](https://github.com/dart-lang/stagehand/blob/master/LICENSE).
+See the [README in the project root](../README.md).
